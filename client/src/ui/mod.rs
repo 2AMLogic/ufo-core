@@ -1,0 +1,3032 @@
+pub mod conversations;
+pub mod editor;
+pub mod history;
+pub mod markdown;
+pub mod masthead;
+pub mod osc;
+pub mod picker;
+pub mod plain;
+pub mod probe;
+pub mod retained;
+pub mod select;
+pub mod status;
+pub mod term;
+pub mod theme;
+pub mod toolrender;
+mod wrap;
+
+use std::collections::{BTreeSet, VecDeque};
+use std::io::{self, Write};
+use std::ops::Range;
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crossterm::event::{
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, KeyCode, KeyEvent, KeyModifiers,
+    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
+use crossterm::terminal;
+use crossterm::tty::IsTty as _;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+
+use crate::fold::{self, Frame, DONE};
+use crate::pr::Pr;
+use crate::record::TurnRecord;
+use crate::ui::conversations::{labeled, Cache, Conversations, Fetch, Pick, Slot, NEW_CHAT_LABEL};
+use crate::ui::editor::{AskState, Key, Outcome};
+use crate::ui::history::History;
+use crate::ui::osc::{Caps, ImageProtocol};
+use crate::ui::picker::{PickKey, PickOutcome, Picker};
+use crate::ui::probe::Probe;
+use crate::ui::retained::{Entry, Retained};
+use crate::ui::select::{ClickTracker, Grain, Selection};
+use crate::ui::status::{Activity, Progress, Signals, StatusRow};
+use crate::ui::term::AltScreen;
+use crate::ui::theme::{ColorMode, Theme};
+use crate::ui::toolrender::OpView;
+use crate::wire::{ConversationRow, OpRequest};
+
+pub const PROMPT_IDLE: &str = "›";
+pub const SENT_BY_UFO: &str = "∵ Sent by UFO";
+pub const FOCUS_CARET: &str = "❯";
+pub const SERVER_PROMPT: &str = ">";
+const READ_ONLY_MESSAGE: &str =
+    "This conversation is read-only here. Reply in {surface} to continue it.";
+const QUEUE_SHOWN: usize = 3;
+const ENTRY_ROWS_MAX: usize = 8;
+const PICKER_ROWS: usize = 8;
+const MULTI_SELECT_HINT: &str = "Space selects. Enter submits.";
+const ECHO_INDENT: &str = "  ";
+const IMAGE_COLS_MAX: u16 = 60;
+const IMAGE_BYTES_MAX: usize = 2 * 1024 * 1024;
+const KEY_COL: usize = 26;
+const FLASH_SECONDS: u64 = 2;
+const EARLY_ABSORBED_MAX: usize = 64;
+
+pub const RESUMED_NOTE: &str = "the service restarted; this turn resumed";
+
+pub fn meter_line(tokens: i64, cost_micro_usd: i64) -> String {
+    format!("{tokens} tok - ${:.6}", cost_micro_usd as f64 / 1_000_000.0)
+}
+
+pub fn wants_fx() -> bool {
+    let term = std::env::var("TERM").unwrap_or_default();
+    io::stdout().is_tty()
+        && !term.is_empty()
+        && term != "dumb"
+        && std::env::var_os("UFO_PLAIN").is_none()
+}
+
+/// Raw mode plus bracketed paste and, where the terminal takes them, the kitty keyboard flags —
+/// entered once for the whole session, before the input thread starts reading.
+pub struct RawGuard {
+    kitty: bool,
+}
+
+impl RawGuard {
+    pub fn enter() -> (RawGuard, Probe) {
+        #[cfg(unix)]
+        crate::interrupt::hold_modes();
+        let _ = terminal::enable_raw_mode();
+        let probe = Probe::query();
+        let _ = crossterm::execute!(
+            io::stdout(),
+            EnableBracketedPaste,
+            EnableMouseCapture,
+            EnableFocusChange
+        );
+        if probe.kitty {
+            let _ = crossterm::execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            );
+        }
+        (RawGuard { kitty: probe.kitty }, probe)
+    }
+}
+
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        if self.kitty {
+            let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
+        let _ = crossterm::execute!(
+            io::stdout(),
+            DisableFocusChange,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
+        let _ = terminal::disable_raw_mode();
+        #[cfg(unix)]
+        crate::interrupt::release_modes();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ClipEntry {
+    Compose,
+    Secret,
+    Path,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reply {
+    None,
+    Send(String),
+    Clipboard(ClipEntry),
+    Attach(std::path::PathBuf),
+    Recall { text: String, arrival_id: String },
+    Choice { text: String, selected: Vec<usize> },
+    ChoiceCancelled,
+    Secret(String),
+    Stop,
+    Detach,
+    OpenConversations,
+    CloseConversations,
+    Open(ConversationRow),
+    NewChat(String),
+    Exit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Focus {
+    Compose,
+    Choose,
+    Secret,
+    Path,
+    Keys,
+    Conversations,
+}
+
+struct Chooser {
+    prompt: String,
+    picker: Picker,
+    multiple: bool,
+    selected: BTreeSet<usize>,
+}
+
+struct SecretEntry {
+    prompt: String,
+    value: String,
+}
+
+struct QueuedSend {
+    text: String,
+    arrival: Option<String>,
+    retracting: bool,
+}
+
+struct PathPick {
+    picker: Picker,
+    token_start: usize,
+}
+
+pub struct App<W: Write = io::Stdout> {
+    pub theme: Theme,
+    pub caps: Caps,
+    signals: Signals,
+    progress: Progress,
+    screen: AltScreen<W>,
+    status: StatusRow,
+    ask: AskState,
+    prompt: String,
+    history: History,
+    queued: VecDeque<QueuedSend>,
+    early_absorbed: Vec<String>,
+    focus: Focus,
+    behind: Focus,
+    chooser: Option<Chooser>,
+    secret: Option<SecretEntry>,
+    path_pick: Option<PathPick>,
+    conversations: Option<Conversations>,
+    cache: Cache,
+    cached: Vec<ConversationRow>,
+    page_draft: AskState,
+    page_hit: Option<(u16, Range<u16>)>,
+    read_only: Option<String>,
+    retained: Retained,
+    view_rows: usize,
+    window_start: usize,
+    hover: Option<(u16, u16)>,
+    exit_images: Vec<String>,
+    selection: Option<Selection>,
+    clicks: ClickTracker,
+    focused: bool,
+    flash: Option<(String, Instant)>,
+    faults: usize,
+    last_reply: String,
+    host: String,
+    channel: String,
+    pr: Option<Pr>,
+    pr_hit: Option<(u16, Range<usize>)>,
+    list_hit: Option<(u16, Range<usize>)>,
+    cwd: PathBuf,
+    working: bool,
+    cols: u16,
+    rows: u16,
+}
+
+impl<W: Write> App<W> {
+    pub fn new(
+        out: W,
+        home_root: &std::path::Path,
+        session_id: &str,
+        theme: Theme,
+        host: String,
+        channel: String,
+        cwd: PathBuf,
+    ) -> App<W> {
+        let caps = Caps::detect();
+        let (cols, rows) = sane_size();
+        let mut screen = AltScreen::new(out, theme.mode);
+        let _ = screen.enter();
+        let cache = Cache::at(home_root, session_id);
+        let cached = cache.load();
+        let mut retained = Retained::new(cols);
+        retained.set_cwd(cwd.clone());
+        App {
+            signals: Signals {
+                enabled: theme.mode != ColorMode::Plain,
+            },
+            progress: Progress::new(),
+            screen,
+            status: StatusRow::new(),
+            ask: AskState::default(),
+            prompt: PROMPT_IDLE.to_string(),
+            history: History::load(home_root),
+            queued: VecDeque::new(),
+            early_absorbed: Vec::new(),
+            focus: Focus::Compose,
+            behind: Focus::Compose,
+            chooser: None,
+            secret: None,
+            path_pick: None,
+            conversations: None,
+            cache,
+            cached,
+            page_draft: AskState::default(),
+            page_hit: None,
+            read_only: None,
+            retained,
+            view_rows: 1,
+            window_start: 0,
+            hover: None,
+            exit_images: Vec::new(),
+            selection: None,
+            clicks: ClickTracker::new(),
+            focused: true,
+            flash: None,
+            faults: 0,
+            last_reply: String::new(),
+            host,
+            channel,
+            pr: None,
+            pr_hit: None,
+            list_hit: None,
+            cwd,
+            working: false,
+            cols,
+            rows,
+            theme,
+            caps,
+        }
+    }
+
+    pub fn set_endpoint(&mut self, host: String, channel: String) {
+        self.host = host;
+        self.channel = channel;
+    }
+
+    pub fn reset_conversation(&mut self, channel: String, read_only: Option<String>) {
+        self.ask = AskState::default();
+        self.prompt = PROMPT_IDLE.to_string();
+        self.queued.clear();
+        self.early_absorbed.clear();
+        self.focus = Focus::Compose;
+        self.behind = Focus::Compose;
+        self.chooser = None;
+        self.secret = None;
+        self.path_pick = None;
+        self.conversations = None;
+        self.page_draft = AskState::default();
+        self.page_hit = None;
+        self.read_only = read_only;
+        self.retained = Retained::new(self.cols);
+        self.retained.set_cwd(self.cwd.clone());
+        self.window_start = 0;
+        self.hover = None;
+        self.exit_images.clear();
+        self.selection = None;
+        self.flash = None;
+        self.faults = 0;
+        self.last_reply.clear();
+        self.channel = channel;
+        self.working = false;
+        self.status = StatusRow::new();
+        let off = self.progress.off(&self.signals);
+        self.splice_raw(&off);
+        self.masthead();
+        self.screen.invalidate();
+    }
+
+    pub fn open_conversations(&mut self, back: bool) -> Fetch {
+        let page = Conversations::new(back, self.cached.clone());
+        let fetch = page.first_fetch();
+        self.conversations = Some(page);
+        if self.focus != Focus::Conversations {
+            self.behind = self.focus;
+            self.page_draft = std::mem::take(&mut self.ask);
+        }
+        self.focus = Focus::Conversations;
+        self.screen.invalidate();
+        fetch
+    }
+
+    pub fn close_conversations(&mut self) {
+        self.conversations = None;
+        self.page_hit = None;
+        if self.focus == Focus::Conversations {
+            self.focus = self.behind;
+            self.ask = std::mem::take(&mut self.page_draft);
+        }
+        self.behind = Focus::Compose;
+        self.screen.invalidate();
+    }
+
+    fn take_focus(&mut self, focus: Focus) {
+        if self.focus == Focus::Conversations {
+            self.behind = focus;
+        } else {
+            self.focus = focus;
+        }
+    }
+
+    pub fn conversations_loaded(
+        &mut self,
+        generation: u32,
+        result: Result<Vec<ConversationRow>, String>,
+    ) {
+        let Some(page) = self.conversations.as_mut() else {
+            return;
+        };
+        let whole = page.loaded(generation, result);
+        if whole && page.rows() != self.cached.as_slice() {
+            self.cached = page.rows().to_vec();
+            self.cache.store(&self.cached);
+        }
+    }
+
+    pub fn conversations_due_fetch(&mut self, now: Instant) -> Option<Fetch> {
+        self.conversations.as_mut()?.due_fetch(now)
+    }
+
+    fn conversations_key(&mut self, key: KeyEvent) -> Reply {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(page) = self.conversations.as_mut() else {
+            self.focus = Focus::Compose;
+            return Reply::None;
+        };
+        let pick = match key.code {
+            KeyCode::Esc => Pick::Close,
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
+                match pick_key(key) {
+                    Some(pick) => page.key(pick),
+                    None => Pick::None,
+                }
+            }
+            KeyCode::Tab => {
+                page.cycle(true);
+                Pick::None
+            }
+            KeyCode::BackTab => {
+                page.cycle(false);
+                Pick::None
+            }
+            KeyCode::End => {
+                page.set_slot(Slot::Entry);
+                Pick::None
+            }
+            KeyCode::Home => {
+                page.home();
+                Pick::None
+            }
+            KeyCode::Enter if page.slot() == Slot::Entry => {
+                let text = self.ask.expand();
+                self.ask = AskState::default();
+                if text.trim().is_empty() {
+                    return Reply::None;
+                }
+                return Reply::NewChat(text);
+            }
+            KeyCode::Char('v') if ctrl && page.slot() == Slot::Entry => {
+                return Reply::Clipboard(ClipEntry::Compose);
+            }
+            _ if page.slot() == Slot::Entry => {
+                let Some(decoded) = decode_key(key) else {
+                    return Reply::None;
+                };
+                let width = self.entry_width();
+                return match self.ask.apply(decoded, &self.history.entries, width) {
+                    Outcome::Cancel => Reply::Exit,
+                    Outcome::Continue | Outcome::Submit => Reply::None,
+                };
+            }
+            _ => match pick_key(key) {
+                Some(pick) => page.key(pick),
+                None => Pick::None,
+            },
+        };
+        self.conversations_step(pick)
+    }
+
+    fn conversations_step(&mut self, pick: Pick) -> Reply {
+        match pick {
+            Pick::None => Reply::None,
+            Pick::Open(row) => Reply::Open(row),
+            Pick::Close => {
+                let back = self.conversations.as_ref().is_some_and(|page| page.back());
+                if back {
+                    self.close_conversations();
+                    Reply::CloseConversations
+                } else {
+                    Reply::Exit
+                }
+            }
+        }
+    }
+
+    pub fn set_pr(&mut self, pr: Option<Pr>) {
+        self.pr = pr;
+    }
+
+    pub fn masthead(&mut self) {
+        self.retained.push(Entry::Masthead);
+    }
+
+    pub fn say(&mut self, text: &str) {
+        self.last_reply = text.to_string();
+        self.retained.push(Entry::Markdown(text.to_string()));
+    }
+
+    pub fn note(&mut self, text: &str) {
+        self.retained.push(Entry::Note(text.to_string()));
+    }
+
+    /// One live frame off the wire, folded into the live turn's record, which the transcript
+    /// draws its rows from. What is left here is what the record does not carry: the bottom line's
+    /// words, the words a copy takes, and the member rows a drain settles. A frame that will not
+    /// decode, or that the record refuses, is counted.
+    pub fn frame(&mut self, event: &str, data: &str) {
+        let Some(frame) = Frame::decode(event, data) else {
+            self.faults += 1;
+            return;
+        };
+        if !self.retained.fold(&frame, &fold::utc_now_rfc3339()) {
+            self.faults += 1;
+        }
+        match frame {
+            Frame::Message { text } => self.last_reply.push_str(&text),
+            Frame::Activity { text, .. } if !text.is_empty() => {
+                self.last_reply.clear();
+                self.status_text(&text);
+            }
+            Frame::SubagentActivity(run) if !run.activity.is_empty() => {
+                let said = format!("{}: {}", run.label(), run.activity);
+                self.status_text(&said);
+            }
+            Frame::Absorbed { arrivals } => self.absorbed(&arrivals),
+            Frame::Cost {
+                tokens,
+                cost_micro_usd,
+            } => self.status_text(&meter_line(tokens, cost_micro_usd)),
+            Frame::Reply { text, .. } | Frame::Comment { text, .. } => self.last_reply = text,
+            Frame::Terminal(frame) if frame.status == DONE => {
+                if let Some(text) = frame.text.filter(|text| !text.is_empty()) {
+                    self.last_reply = text;
+                }
+            }
+            Frame::Activity { .. }
+            | Frame::SubagentActivity(_)
+            | Frame::Resumed { .. }
+            | Frame::Created { .. }
+            | Frame::Sources { .. }
+            | Frame::Terminal(_)
+            | Frame::Parked { .. } => {}
+        }
+    }
+
+    pub fn record(&self) -> Option<&TurnRecord> {
+        self.retained.record()
+    }
+
+    pub fn faults(&self) -> usize {
+        self.faults
+    }
+
+    pub fn status_text(&mut self, text: &str) {
+        if let Activity::Working { since, .. } = self.status.activity {
+            self.status.activity = Activity::Working {
+                since,
+                status: text.to_string(),
+            };
+        }
+    }
+
+    pub fn file(&mut self, name: &str, size: &str, url: &str) {
+        let said = match url.is_empty() {
+            true => name.to_string(),
+            false => format!("{}{name}{}", osc::link_open(url), osc::LINK_CLOSE),
+        };
+        let line = format!("shared {said} ({size} bytes)");
+        self.retained
+            .push(Entry::Raw(vec![Line::styled(line, self.theme.muted)]));
+    }
+
+    /// A step the member reads takes a row; an op the runtime issued for itself draws nothing.
+    pub fn op_started(&mut self, op: &OpRequest) {
+        if OpView::is_step(op) {
+            self.retained.op_started(op);
+        }
+    }
+
+    pub fn op_finished(&mut self, op: &OpRequest, result: &Result<Vec<u8>, String>) {
+        if OpView::is_step(op) {
+            self.retained.op_finished(op, result, &self.theme);
+        }
+        if let Ok(bytes) = result {
+            self.inline_read_image(op, bytes);
+        }
+    }
+
+    fn inline_read_image(&mut self, op: &OpRequest, bytes: &[u8]) {
+        if op.kind != crate::ops::OP_READ
+            || self.caps.images == ImageProtocol::None
+            || bytes.len() > IMAGE_BYTES_MAX
+        {
+            return;
+        }
+        let (mime, size) = match (osc::png_dimensions(bytes), osc::jpeg_dimensions(bytes)) {
+            (Some(size), _) => ("image/png", size),
+            (None, Some(size)) => ("image/jpeg", size),
+            (None, None) => return,
+        };
+        let blob = osc::inline_image(self.caps, bytes, mime, IMAGE_COLS_MAX);
+        if blob.is_empty() {
+            return;
+        }
+        self.exit_images.push(blob);
+        let said = format!(
+            "read image {} ({}×{} px, printed when this session ends)",
+            op.arg, size.0, size.1
+        );
+        self.retained.push(Entry::Note(said));
+    }
+
+    pub fn begin_turn(&mut self) {
+        self.working = true;
+        self.faults = 0;
+        self.retained.begin_turn();
+        self.prompt = PROMPT_IDLE.to_string();
+        self.last_reply.clear();
+        self.status.activity = Activity::Working {
+            since: Instant::now(),
+            status: String::new(),
+        };
+        self.splice_raw(&self.signals.title(&format!("ufo — {}", self.channel)));
+    }
+
+    pub fn end_turn(&mut self, waiting: bool) {
+        self.working = false;
+        self.retained.roll_up_steps();
+        self.status.activity = if waiting {
+            Activity::WaitingInput
+        } else {
+            Activity::Idle
+        };
+        let off = self.progress.off(&self.signals);
+        self.splice_raw(&off);
+        if waiting {
+            self.splice_raw(&self.signals.bell());
+        }
+        if !self.focused {
+            let body = if waiting {
+                "ufo needs input"
+            } else {
+                "ufo replied"
+            };
+            let said = osc::notification(self.caps, body);
+            self.splice_raw(&said);
+        }
+    }
+
+    pub fn set_focus(&mut self, focused: bool) {
+        self.focused = focused;
+        if !focused {
+            self.hover = None;
+        }
+    }
+
+    pub fn reconnecting(&mut self, attempt: u32, of: u32, retry_in_s: u64) {
+        self.status.activity = Activity::Reconnecting {
+            attempt,
+            of,
+            retry_in_s,
+        };
+    }
+
+    pub fn is_working(&self) -> bool {
+        self.working
+    }
+
+    /// The bottom line at the prompt: the work the conversation awaits, clocked from when it
+    /// began, or nothing. A turn in flight keeps its own line.
+    pub fn background(&mut self, work: Option<(String, f64)>) {
+        if self.working {
+            return;
+        }
+        match work {
+            Some((status, began)) => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0.0, |since| since.as_secs_f64());
+                let since = Instant::now()
+                    .checked_sub(Duration::from_secs_f64((now - began).max(0.0)))
+                    .unwrap_or_else(Instant::now);
+                self.status.activity = Activity::Working { since, status };
+            }
+            None => {
+                if let Activity::Working { .. } = self.status.activity {
+                    self.status.activity = Activity::WaitingInput;
+                }
+            }
+        }
+    }
+
+    pub fn tick(&mut self) {
+        if self
+            .flash
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed().as_secs() >= FLASH_SECONDS)
+        {
+            self.flash = None;
+        }
+        self.status.on_tick();
+        self.retained.tick(self.status.phase());
+        if let Some(page) = self.conversations.as_mut() {
+            page.on_tick();
+        }
+        if self.working {
+            let keepalive = self.progress.tick(&self.signals, Instant::now());
+            self.splice_raw(&keepalive);
+        }
+    }
+
+    pub fn ask_prompt(&mut self, prompt: &str) {
+        self.prompt = if prompt.is_empty() || prompt == SERVER_PROMPT {
+            PROMPT_IDLE.to_string()
+        } else {
+            prompt.to_string()
+        };
+        self.take_focus(Focus::Compose);
+    }
+
+    pub fn choose(&mut self, prompt: &str, options: &[String], multiple: bool) {
+        let mut picker = Picker::new(options.to_vec());
+        picker.set_page(PICKER_ROWS);
+        self.chooser = Some(Chooser {
+            prompt: prompt.to_string(),
+            picker,
+            multiple,
+            selected: BTreeSet::new(),
+        });
+        self.take_focus(Focus::Choose);
+    }
+
+    pub fn secret_begin(&mut self, prompt: &str) {
+        self.secret = Some(SecretEntry {
+            prompt: prompt.to_string(),
+            value: String::new(),
+        });
+        self.take_focus(Focus::Secret);
+    }
+
+    pub fn collecting_secret(&self) -> bool {
+        self.secret.is_some()
+    }
+
+    pub fn push_queued(&mut self, text: &str) {
+        self.queued.push_back(QueuedSend {
+            text: text.to_string(),
+            arrival: None,
+            retracting: false,
+        });
+    }
+
+    fn recall_queued(&mut self) -> Reply {
+        let Some(row) = self.queued.iter_mut().rev().find(|row| !row.retracting) else {
+            return Reply::None;
+        };
+        let Some(arrival_id) = row.arrival.clone() else {
+            self.flash = Some(("Still sending — try again.".to_string(), Instant::now()));
+            return Reply::None;
+        };
+        row.retracting = true;
+        Reply::Recall {
+            text: row.text.clone(),
+            arrival_id,
+        }
+    }
+
+    pub fn retracted(&mut self, text: &str, arrival_id: &str, retracted: bool) {
+        let Some(at) = self
+            .queued
+            .iter()
+            .position(|row| row.arrival.as_deref() == Some(arrival_id))
+        else {
+            return;
+        };
+        if !retracted {
+            self.queued[at].retracting = false;
+            self.flash = Some(("Already picked up.".to_string(), Instant::now()));
+            return;
+        }
+        self.queued.remove(at);
+        let restored = if self.ask.text.is_empty() {
+            text.to_string()
+        } else {
+            format!("{text}\n\n{}", self.ask.text)
+        };
+        self.ask.text = restored;
+        self.ask.cursor = self.ask.text.len();
+    }
+
+    pub fn sent_ack(&mut self, text: &str, arrival_id: &str) {
+        if let Some(at) = self.early_absorbed.iter().position(|id| id == arrival_id) {
+            self.early_absorbed.remove(at);
+            self.queued_sent(text);
+            return;
+        }
+        if let Some(row) = self
+            .queued
+            .iter_mut()
+            .find(|row| row.text == text && row.arrival.is_none())
+        {
+            row.arrival = Some(arrival_id.to_string());
+        }
+    }
+
+    pub fn absorbed(&mut self, arrival_ids: &[String]) {
+        for id in arrival_ids {
+            match self
+                .queued
+                .iter()
+                .position(|row| row.arrival.as_deref() == Some(id))
+            {
+                Some(at) => {
+                    let row = self.queued.remove(at).expect("the row was just found");
+                    self.member_echo(&row.text);
+                }
+                None => {
+                    self.early_absorbed.push(id.clone());
+                    let overflow = self.early_absorbed.len().saturating_sub(EARLY_ABSORBED_MAX);
+                    if overflow > 0 {
+                        self.early_absorbed.drain(..overflow);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The ack named a turn but no pending arrival: the message already lives in that turn — a retried
+    /// delivery whose first answer was lost, or a send a spend gate parked whole.
+    pub fn settle_queued(&mut self, text: &str) {
+        if let Some(at) = self.queued.iter().position(|row| row.text == text) {
+            self.queued.remove(at);
+            self.member_echo(text);
+        }
+    }
+
+    pub fn queued_sent(&mut self, text: &str) {
+        if let Some(at) = self.queued.iter().position(|row| row.text == text) {
+            self.queued.remove(at);
+        }
+        self.member_echo(text);
+    }
+
+    pub fn member_replay(&mut self, text: &str) {
+        self.draw_member(text);
+    }
+
+    pub fn fired_replay(&mut self, text: &str) {
+        self.retained.push(Entry::Fired(text.to_string()));
+    }
+
+    pub fn member_echo(&mut self, text: &str) {
+        self.draw_member(text);
+        self.history.push(text);
+    }
+
+    fn draw_member(&mut self, text: &str) {
+        self.retained.push(Entry::Member(text.to_string()));
+        if self.working {
+            self.retained.split_segment();
+        }
+    }
+
+    pub fn on_key(&mut self, key: KeyEvent) -> Reply {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Reply::Exit;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::PageUp => {
+                self.scroll(self.page());
+                return Reply::None;
+            }
+            KeyCode::PageDown => {
+                self.scroll(-self.page());
+                return Reply::None;
+            }
+            KeyCode::Up if ctrl => {
+                self.retained.jump_member(&self.theme, true);
+                return Reply::None;
+            }
+            KeyCode::Down if ctrl => {
+                self.retained.jump_member(&self.theme, false);
+                return Reply::None;
+            }
+            KeyCode::End if self.retained.scrolled() > 0 => {
+                self.retained.scroll_to_end();
+                return Reply::None;
+            }
+            KeyCode::Char('t') if ctrl => {
+                self.retained.toggle_steps();
+                return Reply::None;
+            }
+            _ => {}
+        }
+        match self.focus {
+            Focus::Compose => self.compose_key(key),
+            Focus::Choose => self.choose_key(key),
+            Focus::Secret => self.secret_key(key),
+            Focus::Path => self.path_key(key),
+            Focus::Keys => {
+                self.focus = Focus::Compose;
+                Reply::None
+            }
+            Focus::Conversations => self.conversations_key(key),
+        }
+    }
+
+    pub fn entry_still(&self, entry: ClipEntry) -> bool {
+        match entry {
+            ClipEntry::Compose => {
+                self.focus == Focus::Compose
+                    || self
+                        .conversations
+                        .as_ref()
+                        .is_some_and(|page| page.slot() == Slot::Entry)
+            }
+            ClipEntry::Secret => self.focus == Focus::Secret,
+            ClipEntry::Path => self.focus == Focus::Path,
+        }
+    }
+
+    pub fn paste_image(&mut self, path: &str) {
+        let width = self.entry_width();
+        self.ask
+            .apply(Key::Image(path.to_string()), &self.history.entries, width);
+    }
+
+    /// Where a terminal brackets a paste the member never types the characters, so an entry that ignored
+    /// the event took nothing at all. A masked entry holds one value, so control characters are dropped.
+    pub fn on_paste(&mut self, text: String) -> Reply {
+        match self.focus {
+            Focus::Compose => {
+                if let Some(source) = crate::clipboard::dropped_image(&text) {
+                    return Reply::Attach(source);
+                }
+                let width = self.entry_width();
+                self.ask
+                    .apply(Key::Paste(text), &self.history.entries, width);
+            }
+            Focus::Path => {
+                let width = self.entry_width();
+                self.ask
+                    .apply(Key::Paste(text), &self.history.entries, width);
+                self.refilter_paths();
+            }
+            Focus::Secret => {
+                if let Some(entry) = self.secret.as_mut() {
+                    entry
+                        .value
+                        .extend(text.chars().filter(|ch| !ch.is_control()));
+                }
+            }
+            Focus::Conversations => {
+                if self
+                    .conversations
+                    .as_ref()
+                    .is_some_and(|page| page.slot() == Slot::Entry)
+                {
+                    let width = self.entry_width();
+                    self.ask
+                        .apply(Key::Paste(text), &self.history.entries, width);
+                }
+            }
+            Focus::Choose | Focus::Keys => {}
+        }
+        Reply::None
+    }
+
+    fn compose_key(&mut self, key: KeyEvent) -> Reply {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Left if key.modifiers.is_empty() && self.ask.text.is_empty() => {
+                return Reply::OpenConversations
+            }
+            KeyCode::Char('?') if self.read_only.is_some() => {
+                self.focus = Focus::Keys;
+                return Reply::None;
+            }
+            KeyCode::Esc if self.read_only.is_some() && self.working => return Reply::Stop,
+            _ if self.read_only.is_some() => return Reply::None,
+            KeyCode::Up if !ctrl && self.ask.text.is_empty() && !self.queued.is_empty() => {
+                return self.recall_queued();
+            }
+            KeyCode::Char('o') if ctrl => {
+                self.copy_last_reply();
+                return Reply::None;
+            }
+            KeyCode::Char('v') if ctrl => return Reply::Clipboard(ClipEntry::Compose),
+            KeyCode::Char('?') if self.ask.text.is_empty() => {
+                self.focus = Focus::Keys;
+                return Reply::None;
+            }
+            KeyCode::Char('@') if !ctrl && self.opens_a_mention() => {
+                let width = self.entry_width();
+                self.ask.apply(Key::Char('@'), &self.history.entries, width);
+                self.open_path_pick();
+                return Reply::None;
+            }
+            KeyCode::Char('b') if ctrl && self.working => return Reply::Detach,
+            KeyCode::Esc => {
+                if self.working && self.ask.text.is_empty() {
+                    return Reply::Stop;
+                }
+                self.ask = AskState::default();
+                return Reply::None;
+            }
+            _ => {}
+        }
+        let Some(decoded) = decode_key(key) else {
+            return Reply::None;
+        };
+        let width = self.entry_width();
+        match self.ask.apply(decoded, &self.history.entries, width) {
+            Outcome::Continue => Reply::None,
+            Outcome::Cancel => Reply::Exit,
+            Outcome::Submit => {
+                let text = self.ask.expand();
+                self.ask = AskState::default();
+                if text.trim().is_empty() {
+                    return Reply::None;
+                }
+                Reply::Send(text)
+            }
+        }
+    }
+
+    fn choose_key(&mut self, key: KeyEvent) -> Reply {
+        let Some(chooser) = self.chooser.as_mut() else {
+            self.focus = Focus::Compose;
+            return Reply::None;
+        };
+        if chooser.multiple && key.code == KeyCode::Char(' ') && key.modifiers.is_empty() {
+            if let Some(index) = chooser.picker.current_index() {
+                if !chooser.selected.insert(index) {
+                    chooser.selected.remove(&index);
+                }
+            }
+            return Reply::None;
+        }
+        if chooser.multiple && key.code == KeyCode::Enter {
+            if chooser.selected.is_empty() {
+                return Reply::None;
+            }
+            let choice = chooser
+                .selected
+                .iter()
+                .filter_map(|index| chooser.picker.item(*index))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let selected = chooser.selected.iter().copied().collect();
+            self.chooser = None;
+            self.focus = Focus::Compose;
+            return Reply::Choice {
+                text: choice,
+                selected,
+            };
+        }
+        let Some(pick) = pick_key(key) else {
+            return Reply::None;
+        };
+        let selected = chooser.picker.current_index();
+        match chooser.picker.apply_key(pick) {
+            PickOutcome::Continue => Reply::None,
+            PickOutcome::Picked(choice) => {
+                self.chooser = None;
+                self.focus = Focus::Compose;
+                Reply::Choice {
+                    text: choice,
+                    selected: selected.into_iter().collect(),
+                }
+            }
+            PickOutcome::Cancelled => {
+                self.chooser = None;
+                self.focus = Focus::Compose;
+                Reply::ChoiceCancelled
+            }
+        }
+    }
+
+    fn secret_key(&mut self, key: KeyEvent) -> Reply {
+        let Some(entry) = self.secret.as_mut() else {
+            self.focus = Focus::Compose;
+            return Reply::None;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Enter => {
+                let value = std::mem::take(&mut entry.value);
+                self.secret = None;
+                self.focus = Focus::Compose;
+                Reply::Secret(value)
+            }
+            KeyCode::Esc => {
+                self.secret = None;
+                self.focus = Focus::Compose;
+                Reply::Secret(String::new())
+            }
+            KeyCode::Backspace => {
+                entry.value.pop();
+                Reply::None
+            }
+            KeyCode::Char('u') if ctrl => {
+                entry.value.clear();
+                Reply::None
+            }
+            KeyCode::Char('v') if ctrl => Reply::Clipboard(ClipEntry::Secret),
+            KeyCode::Char(ch) if !ctrl => {
+                entry.value.push(ch);
+                Reply::None
+            }
+            _ => Reply::None,
+        }
+    }
+
+    fn opens_a_mention(&self) -> bool {
+        self.ask.text[..self.ask.cursor]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace)
+    }
+
+    fn open_path_pick(&mut self) {
+        let candidates = picker::path_candidates(&self.cwd, "", 200);
+        if candidates.is_empty() {
+            return;
+        }
+        let mut picker = Picker::new(candidates);
+        picker.set_page(PICKER_ROWS);
+        self.path_pick = Some(PathPick {
+            picker,
+            token_start: self.ask.cursor,
+        });
+        self.focus = Focus::Path;
+    }
+
+    fn path_key(&mut self, key: KeyEvent) -> Reply {
+        let width = self.entry_width();
+        let Some(pick) = self.path_pick.as_mut() else {
+            self.focus = Focus::Compose;
+            return Reply::None;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.path_pick = None;
+                self.focus = Focus::Compose;
+            }
+            KeyCode::Up => {
+                pick.picker.step(-1);
+            }
+            KeyCode::Down => {
+                pick.picker.step(1);
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                let token_start = pick.token_start;
+                let picked = pick.picker.current().map(str::to_string);
+                self.path_pick = None;
+                self.focus = Focus::Compose;
+                match picked {
+                    Some(path) => {
+                        let end = self.ask.cursor;
+                        self.ask.text.replace_range(token_start..end, &path);
+                        self.ask.cursor = token_start + path.len();
+                    }
+                    None => return self.compose_key(key),
+                }
+            }
+            KeyCode::Backspace => {
+                if self.ask.cursor <= pick.token_start {
+                    self.path_pick = None;
+                    self.focus = Focus::Compose;
+                    return Reply::None;
+                }
+                self.ask.apply(Key::Backspace, &self.history.entries, width);
+                self.refilter_paths();
+            }
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Reply::Clipboard(ClipEntry::Path);
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.ask.apply(Key::Char(ch), &self.history.entries, width);
+                self.refilter_paths();
+            }
+            _ => {}
+        }
+        Reply::None
+    }
+
+    fn refilter_paths(&mut self) {
+        let Some(pick) = self.path_pick.as_mut() else {
+            return;
+        };
+        let token = self.ask.text[pick.token_start..self.ask.cursor].to_string();
+        pick.picker.set_filter(&token);
+    }
+
+    fn copy_last_reply(&mut self) {
+        if !self.caps.osc52 || self.last_reply.is_empty() {
+            return;
+        }
+        let escape = osc::copy_to_clipboard(self.caps, &self.last_reply);
+        self.splice_raw(&escape);
+        self.note("Copied the last reply.");
+    }
+
+    pub fn resize(&mut self) {
+        let (cols, rows) = sane_size();
+        self.cols = cols;
+        self.rows = rows;
+        self.retained.set_width(cols);
+        self.screen.invalidate();
+    }
+
+    pub fn on_mouse(&mut self, mouse: MouseEvent) -> Reply {
+        if let (MouseEventKind::Down(MouseButton::Left), Some((row, columns))) =
+            (mouse.kind, self.list_hit.as_ref())
+        {
+            if mouse.row == *row && columns.contains(&(mouse.column as usize)) {
+                return if self.conversations.is_some() {
+                    self.conversations_step(Pick::Close)
+                } else {
+                    Reply::OpenConversations
+                };
+            }
+        }
+        if let Some(page) = self.conversations.as_mut() {
+            let pick = match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    page.scroll(-1);
+                    Pick::None
+                }
+                MouseEventKind::ScrollDown => {
+                    page.scroll(1);
+                    Pick::None
+                }
+                MouseEventKind::Down(MouseButton::Left) => match self.page_hit.as_ref() {
+                    Some((search, _)) if mouse.row == *search => {
+                        page.set_slot(Slot::Search);
+                        Pick::None
+                    }
+                    Some((_, entry)) if entry.contains(&mouse.row) => {
+                        page.set_slot(Slot::Entry);
+                        Pick::None
+                    }
+                    _ => page.click(mouse.row),
+                },
+                _ => Pick::None,
+            };
+            return self.conversations_step(pick);
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll(3),
+            MouseEventKind::ScrollDown => self.scroll(-3),
+            MouseEventKind::Moved => self.hover = Some((mouse.row, mouse.column)),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let (Some((row, columns)), Some(pr)) = (self.pr_hit.as_ref(), self.pr.as_ref()) {
+                    if mouse.row == *row && columns.contains(&(mouse.column as usize)) {
+                        osc::open_url(&pr.url);
+                        self.flash = Some((format!("Opened {}", pr.url), Instant::now()));
+                        self.selection = None;
+                        return Reply::None;
+                    }
+                }
+                if (mouse.row as usize) >= self.view_rows {
+                    self.selection = None;
+                    return Reply::None;
+                }
+                let at = (
+                    self.window_start + mouse.row as usize,
+                    mouse.column as usize,
+                );
+                if self.retained.toggle(at.0, at.1, &self.theme) {
+                    self.selection = None;
+                    return Reply::None;
+                }
+                let grain = self.clicks.press(at);
+                self.selection = Some(Selection::begin(at.0, at.1, grain));
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let edge = select::edge_scroll(mouse.row, self.view_rows);
+                if edge != 0 {
+                    self.scroll(-edge);
+                }
+                if let Some(selection) = self.selection.as_mut() {
+                    let row = (mouse.row as usize).min(self.view_rows.saturating_sub(1));
+                    selection.drag_to(self.window_start + row, mouse.column as usize);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.finish_press(),
+            _ => {}
+        }
+        Reply::None
+    }
+
+    fn finish_press(&mut self) {
+        let Some(selection) = self.selection.take() else {
+            return;
+        };
+        if selection.dragged || selection.grain != Grain::Char {
+            let retained = &mut self.retained;
+            let theme = &self.theme;
+            let text = selection.extract(&mut |line| retained.text_of(line, theme));
+            if !text.trim().is_empty() {
+                let escape = osc::copy_to_clipboard(self.caps, &text);
+                if !escape.is_empty() {
+                    self.splice_raw(&escape);
+                    self.flash = Some(("Copied.".to_string(), Instant::now()));
+                }
+            }
+            self.selection = Some(selection);
+            return;
+        }
+        let (line, col) = selection.anchor;
+        if let Some(url) = self.retained.link_at(line, col, &self.theme) {
+            osc::open_url(&url);
+            self.flash = Some((format!("Opened {url}"), Instant::now()));
+        }
+    }
+
+    pub fn scroll(&mut self, up: isize) {
+        self.retained.scroll(up);
+    }
+
+    pub fn page(&self) -> isize {
+        self.view_rows.saturating_sub(1).max(1) as isize
+    }
+
+    fn transcript_width(&self) -> u16 {
+        self.cols
+    }
+
+    fn entry_width(&self) -> usize {
+        (self.cols as usize)
+            .saturating_sub(3 + wrap::width(&self.prompt))
+            .max(8)
+    }
+
+    pub fn paint(&mut self) {
+        if self.focus == Focus::Conversations && self.conversations.is_some() {
+            self.paint_conversations();
+            return;
+        }
+        let (frame, cursor) = self.compose();
+        self.present(frame, cursor);
+    }
+
+    /// The screen: the transcript window over the dock, which holds the bottom line under a blank
+    /// row whenever it has something to say, the rule, the queue, the entry, and the footer.
+    fn compose(&mut self) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
+        let cols = self.cols as usize;
+        let mut dock: Vec<Line> = Vec::new();
+        let below = self.retained.scrolled();
+        if below > 0 {
+            let noun = if below == 1 { "line" } else { "lines" };
+            dock.push(Line::styled(
+                format!(" ↓ {below} {noun} below — End follows"),
+                self.theme.accent,
+            ));
+        }
+        let activity = self.activity_line(cols);
+        if painted_width(&activity) > 0 {
+            dock.push(Line::raw(""));
+        }
+        dock.push(activity);
+        let rule = || Line::styled("─".repeat(cols.saturating_sub(1)), self.theme.prompt);
+        dock.push(rule());
+        self.queued_rows(&mut dock, cols);
+        let (entry, cursor_in_entry) = self.entry_rows(cols);
+        let entry_at = dock.len();
+        dock.extend(entry);
+        dock.push(rule());
+        let (footer, hits) = status::footer(
+            &self.theme,
+            self.cols,
+            &self.host,
+            &self.channel,
+            self.pr.as_ref(),
+            Some(status::LIST_HINT),
+        );
+        dock.push(footer);
+
+        let avail = (self.rows as usize).saturating_sub(dock.len()).max(1);
+        self.view_rows = avail;
+        let footer_row = (avail + dock.len() - 1) as u16;
+        self.pr_hit = hits.pr.map(|columns| (footer_row, columns));
+        self.list_hit = hits.list.map(|columns| (footer_row, columns));
+        let live = self.live_tail();
+        let window = self.retained.window(avail, &live, &self.theme);
+        self.window_start = window.start;
+        let mut frame = window.lines;
+        let retained = &mut self.retained;
+        let theme = &self.theme;
+        if let Some(selection) = self.selection.as_ref() {
+            for (index, line) in frame.iter_mut().enumerate() {
+                let at = window.start + index;
+                let text = retained.text_of(at, theme);
+                if let Some((from, to)) = selection.cols_for(at, &text) {
+                    *line = highlight_columns(line.clone(), from, to);
+                }
+            }
+        }
+        if let Some((row, col)) = self.hover {
+            let row = row as usize;
+            if row < avail && retained.is_toggle(window.start + row, col as usize, theme) {
+                frame[row] = underline_line(frame[row].clone());
+            }
+        }
+        frame.extend(dock);
+        let cursor =
+            cursor_in_entry.map(|(row, col)| ((avail + entry_at + row) as u16, col as u16));
+        (frame, cursor)
+    }
+
+    fn present(&mut self, mut frame: Vec<Line<'static>>, cursor: Option<(u16, u16)>) {
+        let cols = self.cols as usize;
+        for line in frame.iter_mut() {
+            if painted_width(line) > cols {
+                *line = clip_line(line, cols);
+            }
+        }
+        let _ = self.screen.frame(&frame, cursor);
+    }
+
+    fn live_tail(&self) -> Vec<Line<'static>> {
+        let Some(tail) = self.retained.open_answer_tail() else {
+            return Vec::new();
+        };
+        if tail.trim().is_empty() || self.retained.scrolled() > 0 {
+            return Vec::new();
+        }
+        markdown::render_live(
+            tail.trim_end_matches('\n'),
+            &self.theme,
+            self.transcript_width(),
+        )
+    }
+
+    fn activity_line(&self, width: usize) -> Line<'static> {
+        if let Some((said, at)) = self.flash.as_ref() {
+            if at.elapsed().as_secs() < FLASH_SECONDS {
+                let said = format!(" {said}");
+                return Line::styled(wrap::clip(&said, width).to_string(), self.theme.muted);
+            }
+        }
+        self.status.render(&self.theme, width as u16)
+    }
+
+    fn queued_rows(&self, dock: &mut Vec<Line<'static>>, width: usize) {
+        for held in self.queued.iter().take(QUEUE_SHOWN) {
+            let first = held.text.lines().next().unwrap_or("");
+            let row = format!(
+                "{PROMPT_IDLE} {}",
+                wrap::clip(first, width.saturating_sub(4))
+            );
+            dock.push(Line::styled(row, self.theme.queued));
+        }
+        let hidden = self.queued.len().saturating_sub(QUEUE_SHOWN);
+        if hidden > 0 {
+            dock.push(Line::styled(
+                format!("… +{hidden} queued"),
+                self.theme.queued,
+            ));
+        }
+    }
+
+    fn paint_conversations(&mut self) {
+        let cols = self.cols as usize;
+        let rule = || Line::styled("─".repeat(cols.saturating_sub(1)), self.theme.prompt);
+        let mark = masthead::masthead(&self.theme, self.cols);
+        let mut dock: Vec<Line> = vec![self.activity_line(cols), rule()];
+        let page = self.conversations.as_ref().expect("the page is up");
+        let (search, search_col) = page.search_line(&self.theme, self.cols);
+        let search_at = dock.len();
+        dock.push(search);
+        dock.push(rule());
+        let entry_prompt = labeled(NEW_CHAT_LABEL, page.slot() == Slot::Entry);
+        let (entry, cursor_in_entry) = self.compose_rows_with(&entry_prompt);
+        let entry_at = dock.len();
+        let entry_rows = entry.len();
+        dock.extend(entry);
+        dock.push(rule());
+        let (footer, hits) = status::footer(
+            &self.theme,
+            self.cols,
+            &self.host,
+            &self.channel,
+            self.pr.as_ref(),
+            None,
+        );
+        dock.push(footer);
+
+        let avail = (self.rows as usize)
+            .saturating_sub(dock.len() + mark.len())
+            .max(1);
+        let window = avail + mark.len();
+        self.view_rows = 0;
+        let footer_row = (window + dock.len() - 1) as u16;
+        self.pr_hit = hits.pr.map(|columns| (footer_row, columns));
+        self.list_hit = hits.list.map(|columns| (footer_row, columns));
+        self.page_hit = Some((
+            (window + search_at) as u16,
+            (window + entry_at) as u16..(window + entry_at + entry_rows) as u16,
+        ));
+        let page = self.conversations.as_mut().expect("the page is up");
+        page.set_layout(mark.len(), avail);
+        let cursor = match page.slot() {
+            Slot::Entry => {
+                cursor_in_entry.map(|(row, col)| ((window + entry_at + row) as u16, col as u16))
+            }
+            Slot::Search => Some(((window + search_at) as u16, search_col)),
+            Slot::List => None,
+        };
+        let mut frame = mark;
+        frame.extend(page.render(&self.theme, self.cols, avail));
+        frame.extend(dock);
+        self.present(frame, cursor);
+    }
+
+    fn entry_rows(&self, width: usize) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+        match self.focus {
+            Focus::Compose => self.compose_rows(),
+            Focus::Choose => (self.choose_rows(width), None),
+            Focus::Secret => self.secret_rows(width),
+            Focus::Path => self.path_rows(width),
+            Focus::Keys => (self.keys_rows(width), None),
+            Focus::Conversations => (Vec::new(), None),
+        }
+    }
+
+    fn compose_rows(&self) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+        if let Some(surface) = &self.read_only {
+            let said = READ_ONLY_MESSAGE.replace("{surface}", surface);
+            let row = Line::styled(
+                wrap::clip(&said, self.cols as usize).to_string(),
+                self.theme.muted,
+            );
+            return (vec![row], None);
+        }
+        self.compose_rows_with(&self.prompt)
+    }
+
+    fn compose_rows_with(&self, prompt: &str) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+        let prompt = if prompt == PROMPT_IDLE {
+            FOCUS_CARET
+        } else {
+            prompt
+        };
+        let width = (self.cols as usize)
+            .saturating_sub(3 + wrap::width(prompt))
+            .max(8);
+        let layout = self.ask.render(width);
+        let prompt_w = wrap::width(prompt);
+        let total = layout.rows.len();
+        let window = ENTRY_ROWS_MAX.min(total.max(1));
+        let first = layout
+            .cursor_row
+            .saturating_sub(window - 1)
+            .min(total.saturating_sub(window));
+        let mut rows = Vec::new();
+        let mut cursor = None;
+        for (index, row) in layout.rows.iter().enumerate().skip(first).take(window) {
+            let lead = if index == 0 {
+                Span::styled(format!("{prompt} "), self.theme.prompt)
+            } else {
+                Span::raw(ECHO_INDENT.to_string())
+            };
+            let shown = rows.len();
+            if index == layout.cursor_row {
+                let lead_w = if index == 0 { prompt_w + 1 } else { 2 };
+                cursor = Some((shown, lead_w + layout.cursor_col));
+            }
+            rows.push(Line::from(vec![lead, Span::raw(row.clone())]));
+        }
+        if rows.is_empty() {
+            rows.push(Line::from(Span::styled(
+                prompt.to_string(),
+                self.theme.prompt,
+            )));
+            cursor = Some((0, prompt_w + 1));
+        }
+        (rows, cursor)
+    }
+
+    fn choose_rows(&self, width: usize) -> Vec<Line<'static>> {
+        let Some(chooser) = self.chooser.as_ref() else {
+            return Vec::new();
+        };
+        let mut rows = vec![Line::styled(
+            wrap::clip(&chooser.prompt, width).to_string(),
+            self.theme.heading,
+        )];
+        if chooser.multiple {
+            rows.push(Line::styled(MULTI_SELECT_HINT, self.theme.muted));
+        }
+        if chooser.picker.visible_len() == 0 && !chooser.picker.filter.is_empty() {
+            rows.push(Line::styled(
+                "Nothing matches.".to_string(),
+                self.theme.muted,
+            ));
+        } else {
+            let mut choices =
+                chooser
+                    .picker
+                    .render(&self.theme, width.saturating_sub(4) as u16, PICKER_ROWS);
+            if chooser.multiple {
+                for (offset, row) in choices.iter_mut().enumerate() {
+                    let Some(index) = chooser.picker.index_at(offset, PICKER_ROWS) else {
+                        continue;
+                    };
+                    let checked = chooser.selected.contains(&index);
+                    row.spans.insert(
+                        1,
+                        Span::styled(
+                            if checked { "[x] " } else { "[ ] " },
+                            if checked {
+                                self.theme.accent
+                            } else {
+                                self.theme.muted
+                            },
+                        ),
+                    );
+                }
+            }
+            rows.extend(choices);
+        }
+        rows
+    }
+
+    fn secret_rows(&self, width: usize) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+        let Some(entry) = self.secret.as_ref() else {
+            return (Vec::new(), None);
+        };
+        let label = format!("{} (hidden): ", wrap::clip(&entry.prompt, width / 2));
+        let mask = "•".repeat(entry.value.chars().count());
+        let col = wrap::width(&label) + mask.chars().count();
+        let row = Line::from(vec![
+            Span::styled(label, self.theme.prompt),
+            Span::raw(mask),
+        ]);
+        (vec![row], Some((0, col)))
+    }
+
+    fn path_rows(&self, width: usize) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+        let (mut rows, cursor) = self.compose_rows();
+        if let Some(pick) = self.path_pick.as_ref() {
+            rows.extend(pick.picker.render(&self.theme, width as u16, PICKER_ROWS));
+        }
+        (rows, cursor)
+    }
+
+    fn keys_rows(&self, width: usize) -> Vec<Line<'static>> {
+        let mut pairs = history::hotkeys();
+        if self.caps.osc52 {
+            pairs.push(("Ctrl+O", "Copy last reply"));
+        }
+        let mut rows = Vec::new();
+        for (key, action) in pairs {
+            let pad = " ".repeat(KEY_COL.saturating_sub(wrap::width(key)));
+            rows.push(Line::from(vec![
+                Span::styled(format!("{key}{pad}"), self.theme.accent),
+                Span::styled(
+                    wrap::clip(action, width.saturating_sub(KEY_COL)).to_string(),
+                    self.theme.muted,
+                ),
+            ]));
+        }
+        rows
+    }
+
+    fn splice_raw(&mut self, bytes: &str) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.screen.splice(bytes);
+    }
+
+    pub fn close(&mut self) {
+        self.retained.roll_up_steps();
+        let document = self.retained.document(&self.theme);
+        let _ = self.screen.leave();
+        let _ = self.screen.print_document(&document);
+        for blob in std::mem::take(&mut self.exit_images) {
+            self.splice_raw(&blob);
+            self.splice_raw("\r\n");
+        }
+    }
+}
+
+fn painted_width(line: &Line<'static>) -> usize {
+    line.spans
+        .iter()
+        .flat_map(|span| wrap::units(&span.content))
+        .map(|(_, step)| step)
+        .sum()
+}
+
+fn clip_line(line: &Line<'static>, width: usize) -> Line<'static> {
+    let mut left = width;
+    let mut full = false;
+    let mut spans = Vec::new();
+    for span in &line.spans {
+        let mut kept = String::new();
+        for (unit, step) in wrap::units(&span.content) {
+            if step == 0 {
+                kept.push_str(unit);
+            } else if !full && step <= left {
+                left -= step;
+                kept.push_str(unit);
+            } else {
+                full = true;
+            }
+        }
+        if !kept.is_empty() {
+            spans.push(Span::styled(kept, span.style));
+        }
+    }
+    let mut cut = Line::from(spans).style(line.style);
+    cut.alignment = line.alignment;
+    cut
+}
+
+fn underline_line(line: Line<'static>) -> Line<'static> {
+    let spans = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            let style = span.style.add_modifier(Modifier::UNDERLINED);
+            Span::styled(span.content, style)
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans).style(line.style.add_modifier(Modifier::UNDERLINED))
+}
+
+fn highlight_columns(line: Line<'static>, from: usize, to: usize) -> Line<'static> {
+    let base = line.style;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut at = 0usize;
+    for span in line.spans {
+        let mut plain = String::new();
+        let mut lit = false;
+        let flush = |spans: &mut Vec<Span<'static>>, text: &mut String, lit: bool, style: Style| {
+            if text.is_empty() {
+                return;
+            }
+            let style = if lit {
+                style.add_modifier(Modifier::REVERSED)
+            } else {
+                style
+            };
+            spans.push(Span::styled(std::mem::take(text), style));
+        };
+        let style = base.patch(span.style);
+        for (unit, step) in wrap::units(&span.content) {
+            if step == 0 {
+                plain.push_str(unit);
+                continue;
+            }
+            let inside = at >= from && at < to;
+            if inside != lit {
+                flush(&mut spans, &mut plain, lit, style);
+                lit = inside;
+            }
+            plain.push_str(unit);
+            at += step;
+        }
+        flush(&mut spans, &mut plain, lit, style);
+    }
+    let mut width = at;
+    if width < to {
+        let pad_from = width.max(from);
+        if to > pad_from {
+            while width < pad_from {
+                spans.push(Span::raw(" "));
+                width += 1;
+            }
+            spans.push(Span::styled(
+                " ".repeat(to.min(pad_from + 200) - pad_from),
+                Style::new().add_modifier(Modifier::REVERSED),
+            ));
+        }
+    }
+    Line::from(spans)
+}
+
+fn sane_size() -> (u16, u16) {
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    (
+        if cols >= 20 { cols } else { 80 },
+        if rows >= 5 { rows } else { 24 },
+    )
+}
+
+pub fn pick_key(key: KeyEvent) -> Option<PickKey> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    Some(match key.code {
+        KeyCode::Up => PickKey::Up,
+        KeyCode::Down => PickKey::Down,
+        KeyCode::PageUp => PickKey::PageUp,
+        KeyCode::PageDown => PickKey::PageDown,
+        KeyCode::Enter => PickKey::Enter,
+        KeyCode::Esc => PickKey::Esc,
+        KeyCode::Backspace => PickKey::Backspace,
+        KeyCode::Char('c') | KeyCode::Char('d') if ctrl => PickKey::Esc,
+        KeyCode::Char('k') if ctrl => PickKey::Up,
+        KeyCode::Char('j') if ctrl => PickKey::Down,
+        KeyCode::Char(ch) if !ctrl => PickKey::Char(ch),
+        _ => return None,
+    })
+}
+
+pub fn decode_key(key: KeyEvent) -> Option<Key> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    Some(match key.code {
+        KeyCode::Enter if shift => Key::ShiftEnter,
+        KeyCode::Enter if alt => Key::InsertNewline,
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Backspace if alt => Key::KillWord,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Left if ctrl || alt => Key::WordLeft,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right if ctrl || alt => Key::WordRight,
+        KeyCode::Right => Key::Right,
+        KeyCode::Up => Key::CursorUp,
+        KeyCode::Down => Key::CursorDown,
+        KeyCode::Home if ctrl => Key::BufferHome,
+        KeyCode::End if ctrl => Key::BufferEnd,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::Char('a') if ctrl => Key::Home,
+        KeyCode::Char('e') if ctrl => Key::End,
+        KeyCode::Char('u') if ctrl => Key::KillLine,
+        KeyCode::Char('w') if ctrl => Key::KillWord,
+        KeyCode::Char('y') if ctrl => Key::Yank,
+        KeyCode::Char('z') if ctrl => Key::Undo,
+        KeyCode::Char('j') if ctrl => Key::InsertNewline,
+        KeyCode::Char('p') if ctrl => Key::HistPrev,
+        KeyCode::Char('n') if ctrl => Key::HistNext,
+        KeyCode::Char('d') if ctrl => Key::Eof,
+        KeyCode::Char('b') if alt => Key::WordLeft,
+        KeyCode::Char('f') if alt => Key::WordRight,
+        KeyCode::Char(ch) if !ctrl && !alt => Key::Char(ch),
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::status::SPINNER_FRAMES;
+    use crate::wire::Turn;
+
+    fn shared_line() -> Line<'static> {
+        let open = osc::link_open("https://ufo.test/artifacts/abc?exp=1&sig=2");
+        let said = format!("shared {open}name{} (12 bytes)", osc::LINK_CLOSE);
+        Line::styled(said, Style::new())
+    }
+
+    fn visible(text: &str) -> String {
+        wrap::units(text)
+            .into_iter()
+            .filter(|(_, step)| *step > 0)
+            .map(|(unit, _)| unit)
+            .collect()
+    }
+
+    fn app_on_memory() -> App<Vec<u8>> {
+        app_at(scratch_home(), "ufo.test", "host.1")
+    }
+
+    fn scratch_home() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let home = std::env::temp_dir().join(format!(
+            "ufo-ui-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("a scratch home");
+        home
+    }
+
+    fn app_at(home: PathBuf, host: &str, session: &str) -> App<Vec<u8>> {
+        App::new(
+            Vec::new(),
+            &home.clone(),
+            session,
+            Theme::for_mode(ColorMode::TrueColor, theme::Scheme::Dark),
+            host.to_string(),
+            "host.1".to_string(),
+            home,
+        )
+    }
+
+    fn asked(op: &str, kind: &str, params: &str) -> OpRequest {
+        let params = match (kind, serde_json::from_str::<serde_json::Value>(params)) {
+            ("exec", Ok(mut parsed)) if parsed.get("argv").is_some() => {
+                let command = parsed["argv"]
+                    .as_array()
+                    .expect("argv is a list")
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                parsed["safety_argv"] = serde_json::json!(["bash", "-lc", command]);
+                parsed.to_string()
+            }
+            _ => params.to_string(),
+        };
+        OpRequest {
+            op_id: "op1".to_string(),
+            kind: kind.to_string(),
+            name: op.to_string(),
+            timeout_s: 30,
+            arg: String::new(),
+            params,
+            call_id: String::new(),
+        }
+    }
+
+    fn plumbing(kind: &str, arg: &str, params: &str) -> OpRequest {
+        OpRequest {
+            op_id: format!("plumbing-{kind}-{arg}"),
+            kind: kind.to_string(),
+            name: if kind == "exec" { "exec" } else { "" }.to_string(),
+            timeout_s: 30,
+            arg: arg.to_string(),
+            params: params.to_string(),
+            call_id: String::new(),
+        }
+    }
+
+    fn transcript(app: &mut App<Vec<u8>>) -> String {
+        let theme = app.theme.clone();
+        app.retained
+            .document(&theme)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+
+    fn exec_reply(exit_code: i32, stdout: &str) -> String {
+        format!(
+            r#"{{"exit_code":{exit_code},"stdout_b64":"{}","stderr_b64":""}}"#,
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                stdout.as_bytes()
+            )
+        )
+    }
+
+    fn message(app: &mut App<Vec<u8>>, text: &str) {
+        app.frame("message", &serde_json::json!({ "text": text }).to_string());
+    }
+
+    fn labelled(app: &mut App<Vec<u8>>, text: &str, call_id: &str) {
+        app.frame(
+            "activity",
+            &serde_json::json!({ "text": text, "call_id": call_id }).to_string(),
+        );
+    }
+
+    fn members(app: &mut App<Vec<u8>>) -> Vec<String> {
+        let theme = app.theme.clone();
+        app.retained
+            .document(&theme)
+            .iter()
+            .map(Line::to_string)
+            .filter(|line| line.starts_with('›'))
+            .map(|line| line.trim_start_matches('›').trim().to_string())
+            .collect()
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn typed(app: &mut App<Vec<u8>>, text: &str) {
+        for character in text.chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
+    }
+
+    #[test]
+    fn enter_sends_what_was_typed_and_leaves_the_composer_empty() {
+        let mut app = app_on_memory();
+        typed(&mut app, "hello there");
+        let reply = app.on_key(key(KeyCode::Enter));
+        assert!(matches!(&reply, Reply::Send(text) if text == "hello there"));
+        assert!(app.ask.text.is_empty());
+    }
+
+    #[test]
+    fn escape_stops_a_running_turn_but_first_clears_a_draft() {
+        let mut app = app_on_memory();
+        app.begin_turn();
+        typed(&mut app, "a draft");
+        assert!(
+            matches!(app.on_key(key(KeyCode::Esc)), Reply::None),
+            "escape with a draft clears it rather than stopping the turn"
+        );
+        assert!(app.ask.text.is_empty());
+        assert!(matches!(app.on_key(key(KeyCode::Esc)), Reply::Stop));
+    }
+
+    #[test]
+    fn detach_is_offered_only_while_a_turn_runs() {
+        let mut app = app_on_memory();
+        assert!(matches!(app.on_key(ctrl(KeyCode::Char('b'))), Reply::None));
+        app.begin_turn();
+        assert!(matches!(
+            app.on_key(ctrl(KeyCode::Char('b'))),
+            Reply::Detach
+        ));
+    }
+
+    #[test]
+    fn the_hotkey_sheet_opens_on_an_empty_composer_and_any_key_closes_it() {
+        let mut app = app_on_memory();
+        typed(&mut app, "?");
+        assert!(
+            matches!(app.focus, Focus::Keys),
+            "a lone question mark opens the sheet"
+        );
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(matches!(app.focus, Focus::Compose));
+        typed(&mut app, "draft?");
+        assert!(
+            matches!(app.focus, Focus::Compose),
+            "a question mark inside a draft is just a character"
+        );
+        assert_eq!(app.ask.text, "draft?");
+    }
+
+    #[test]
+    fn ctrl_v_asks_for_the_clipboard_and_ctrl_o_copies_the_last_reply() {
+        let mut app = app_on_memory();
+        assert!(matches!(
+            app.on_key(ctrl(KeyCode::Char('v'))),
+            Reply::Clipboard(ClipEntry::Compose)
+        ));
+        app.last_reply = "the answer".to_string();
+        app.caps.osc52 = false;
+        app.on_key(ctrl(KeyCode::Char('o')));
+        assert!(
+            !String::from_utf8_lossy(app.screen.written()).contains("52;c;"),
+            "a terminal that cannot take a clipboard sequence is never sent one"
+        );
+        app.caps.osc52 = true;
+        app.on_key(ctrl(KeyCode::Char('o')));
+        let painted = String::from_utf8_lossy(app.screen.written()).into_owned();
+        assert!(
+            painted.contains("52;c;"),
+            "the reply is copied through the terminal's own clipboard: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn a_chooser_answers_a_pick_and_a_cancel() {
+        let mut app = app_on_memory();
+        app.choose(
+            "which?",
+            &["first".to_string(), "second".to_string()],
+            false,
+        );
+        app.on_key(key(KeyCode::Down));
+        let reply = app.on_key(key(KeyCode::Enter));
+        assert!(matches!(
+            &reply,
+            Reply::Choice { text, selected } if text == "second" && selected == &[1]
+        ));
+        assert!(app.chooser.is_none());
+        assert!(matches!(app.focus, Focus::Compose));
+        app.choose("again?", &["only".to_string()], false);
+        assert!(matches!(
+            app.on_key(key(KeyCode::Esc)),
+            Reply::ChoiceCancelled
+        ));
+        assert!(app.chooser.is_none());
+    }
+
+    #[test]
+    fn a_multi_chooser_toggles_and_submits_in_list_order() {
+        let mut app = app_on_memory();
+        app.choose(
+            "Select services",
+            &["Mail".to_string(), "Calendar".to_string()],
+            true,
+        );
+        assert!(matches!(app.on_key(key(KeyCode::Enter)), Reply::None));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Char(' ')));
+        let rendered = app
+            .choose_rows(80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains(MULTI_SELECT_HINT), "{rendered}");
+        assert!(rendered.contains("[x] Mail"), "{rendered}");
+        assert!(rendered.contains("[x] Calendar"), "{rendered}");
+        assert!(matches!(
+            app.on_key(key(KeyCode::Enter)),
+            Reply::Choice { text, selected }
+                if text == "Mail, Calendar" && selected == [0, 1]
+        ));
+        assert!(app.chooser.is_none());
+        assert!(matches!(app.focus, Focus::Compose));
+    }
+
+    #[test]
+    fn a_secret_entry_hides_what_is_typed_and_answers_on_enter() {
+        let mut app = app_on_memory();
+        app.secret_begin("paste the key");
+        typed(&mut app, "sk-live-abc");
+        assert!(app.collecting_secret());
+        app.paint();
+        let painted = String::from_utf8_lossy(app.screen.written()).into_owned();
+        assert!(
+            !painted.contains("sk-live-abc"),
+            "a secret never reaches the screen: {painted:?}"
+        );
+        assert!(
+            painted.contains('•'),
+            "what the member typed is drawn masked: {painted:?}"
+        );
+        let reply = app.on_key(key(KeyCode::Enter));
+        assert!(matches!(&reply, Reply::Secret(value) if value == "sk-live-abc"));
+        assert!(!app.collecting_secret());
+        assert!(matches!(app.focus, Focus::Compose));
+    }
+
+    #[test]
+    fn a_pasted_secret_loses_the_newline_that_came_with_it() {
+        let mut app = app_on_memory();
+        app.secret_begin("paste the key");
+        app.on_paste("sk-live-abc\n".to_string());
+        let reply = app.on_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&reply, Reply::Secret(value) if value == "sk-live-abc"),
+            "a key copied with its trailing newline still posts clean: {reply:?}"
+        );
+    }
+
+    #[test]
+    fn a_secret_entry_can_be_abandoned() {
+        let mut app = app_on_memory();
+        app.secret_begin("paste the key");
+        typed(&mut app, "half");
+        assert!(matches!(app.on_key(key(KeyCode::Esc)), Reply::Secret(value) if value.is_empty()));
+        assert!(!app.collecting_secret());
+    }
+
+    #[test]
+    fn a_choose_key_with_no_chooser_falls_back_to_the_composer() {
+        let mut app = app_on_memory();
+        app.focus = Focus::Choose;
+        assert!(matches!(app.on_key(key(KeyCode::Enter)), Reply::None));
+        assert!(matches!(app.focus, Focus::Compose));
+    }
+
+    #[test]
+    fn up_on_an_empty_composer_recalls_only_when_something_is_queued() {
+        let mut app = app_on_memory();
+        assert!(
+            matches!(app.on_key(key(KeyCode::Up)), Reply::None),
+            "nothing queued, nothing recalled"
+        );
+        app.push_queued("queued words");
+        app.sent_ack("queued words", "arr-1");
+        let reply = app.on_key(key(KeyCode::Up));
+        assert!(matches!(&reply, Reply::Recall { text, .. } if text == "queued words"));
+    }
+
+    #[test]
+    fn a_painted_frame_states_the_transcript_and_the_endpoint() {
+        let mut app = app_on_memory();
+        app.say("the assistant spoke");
+        app.member_echo("the member answered");
+        app.paint();
+        let painted = String::from_utf8_lossy(app.screen.written()).into_owned();
+        assert!(painted.contains("the assistant spoke"), "{painted}");
+        assert!(painted.contains("the member answered"));
+        assert!(
+            painted.contains("host.1"),
+            "the footer names the conversation"
+        );
+    }
+
+    #[test]
+    fn a_streaming_reply_leaves_nothing_held_until_it_commits() {
+        let mut app = app_on_memory();
+        app.begin_turn();
+        let before = markdown::held_blocks();
+        for delta in [
+            "```rust\n",
+            "fn parse(line",
+            ": &str) -> usize {\n",
+            "    line.len()\n",
+            "}\n",
+        ] {
+            message(&mut app, delta);
+            app.paint();
+        }
+        assert_eq!(
+            markdown::held_blocks(),
+            before,
+            "the open tail is drawn, never held"
+        );
+        message(&mut app, "```\n\n");
+        app.paint();
+        assert!(
+            markdown::held_blocks() > before,
+            "the block holds its colours once it settles into the transcript"
+        );
+    }
+
+    #[test]
+    fn contiguous_commands_stand_as_the_latest_and_every_one_counts() {
+        let mut app = app_on_memory();
+        app.begin_turn();
+        for run in [
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+        ] {
+            let mut op = asked("exec", "exec", &format!(r#"{{"argv":["make","{run}"]}}"#));
+            op.op_id = format!("op-{run}");
+            app.op_finished(
+                &op,
+                &Ok(exec_reply(0, &format!("built {run}\n")).into_bytes()),
+            );
+        }
+        let document = transcript(&mut app);
+        assert!(
+            document.contains("⏺ $ make theta") && document.contains("built theta"),
+            "the latest command stands with its output: {document}"
+        );
+        assert!(
+            !document.contains("make alpha") && !document.contains("built alpha"),
+            "the commands before it gave up their place: {document}"
+        );
+        app.end_turn(false);
+        assert!(
+            transcript(&mut app).contains("Completed 8 steps"),
+            "the turn's end counts every call it ran"
+        );
+    }
+
+    #[test]
+    fn the_bottom_line_stands_under_a_blank_row_only_while_it_says_something() {
+        let mut app = app_on_memory();
+        for index in 0..40 {
+            app.note(&format!("line {index}"));
+        }
+        let (idle, _) = app.compose();
+        let rule = idle
+            .iter()
+            .position(|line| line.to_string().starts_with('─'))
+            .expect("the rule");
+        assert_eq!(
+            idle[rule - 1].to_string(),
+            "",
+            "idle: the empty bottom line"
+        );
+        assert!(
+            idle[rule - 2].to_string().starts_with("line "),
+            "the transcript reaches the bottom line: {}",
+            idle[rule - 2]
+        );
+        app.begin_turn();
+        app.status_text("Reading the notes");
+        let (working, _) = app.compose();
+        let spinner = working
+            .iter()
+            .position(|line| line.to_string().contains("Reading the notes"))
+            .expect("the bottom line");
+        assert_eq!(working[spinner - 1].to_string(), "");
+        assert!(
+            working[spinner - 2].to_string().starts_with("line "),
+            "one blank row stands between the transcript and the bottom line: {}",
+            working[spinner - 2]
+        );
+    }
+
+    #[test]
+    fn a_label_heads_the_row_of_the_call_it_names() {
+        let mut app = app_on_memory();
+        app.begin_turn();
+        labelled(&mut app, "counting the rows", "c1");
+        let mut op = asked("exec", "exec", r#"{"argv":["wc","-l"]}"#);
+        op.call_id = "c1".to_string();
+        app.op_started(&op);
+        app.op_finished(&op, &Ok(exec_reply(0, "42\n").into_bytes()));
+        let document = transcript(&mut app);
+        assert!(
+            document.contains("⏺ counting the rows") && document.contains("42"),
+            "the agent's words head the row and its result stands under them: {document}"
+        );
+        assert!(
+            document.contains("  $ wc -l"),
+            "the command stands under the words, since it ran on this machine: {document}"
+        );
+        app.end_turn(false);
+        assert!(
+            transcript(&mut app).contains("Completed 1 step"),
+            "the label and the call it names are one step, not two"
+        );
+    }
+
+    #[test]
+    fn a_label_for_another_call_leaves_the_row_headed_by_its_command() {
+        let mut app = app_on_memory();
+        app.begin_turn();
+        labelled(&mut app, "a different call", "c9");
+        let mut op = asked("exec", "exec", r#"{"argv":["wc","-l"]}"#);
+        op.call_id = "c1".to_string();
+        app.op_started(&op);
+        app.op_finished(&op, &Ok(exec_reply(0, "42\n").into_bytes()));
+        let document = transcript(&mut app);
+        assert!(
+            document.contains("⏺ a different call") && document.contains("⏺ $ wc -l"),
+            "each stands on its own row: {document}"
+        );
+        app.end_turn(false);
+        assert!(transcript(&mut app).contains("Completed 2 steps"));
+    }
+
+    #[test]
+    fn text_between_two_dispatches_is_the_thought_each_round_wrote() {
+        let mut app = app_on_memory();
+        app.begin_turn();
+        message(&mut app, "Template is in place. Now writing the schema.\n");
+        labelled(&mut app, "Build the content management system", "");
+        message(&mut app, "Now the routes with auth:\n");
+        labelled(&mut app, "Create the blog admin dashboard", "");
+        message(&mut app, "Now the frontend pages.\n");
+        app.end_turn(false);
+        let document = transcript(&mut app);
+        assert!(
+            !document.contains("schema.Now") && !document.contains("auth:Now"),
+            "a round's words end where the next round's begin: {document}"
+        );
+        app.retained.toggle_steps();
+        let opened = transcript(&mut app);
+        let thought = opened
+            .find("Now the routes with auth:")
+            .expect("the thought");
+        let after = opened
+            .find("Create the blog admin dashboard")
+            .expect("the call it wrote before");
+        assert!(
+            thought < after,
+            "each round's words stand above the call it made: {opened}"
+        );
+    }
+
+    #[test]
+    fn a_failed_op_states_its_failure() {
+        let mut app = app_on_memory();
+        app.op_finished(
+            &asked("exec", "exec", r#"{"argv":["make"]}"#),
+            &Err("ENOENT: no such tool".to_string()),
+        );
+        let document = transcript(&mut app);
+        assert!(document.contains("ENOENT: no such tool"), "{document}");
+    }
+
+    #[test]
+    fn a_call_row_clips_to_the_width() {
+        let mut app = app_on_memory();
+        app.retained.set_width(14);
+        app.op_finished(
+            &asked("exec", "exec", r#"{"argv":["make","test","--verbose"]}"#),
+            &Ok(exec_reply(0, "").into_bytes()),
+        );
+        assert!(
+            transcript(&mut app).contains("⏺ $ make test…"),
+            "the header takes the room the transcript has and says it was cut"
+        );
+    }
+
+    #[test]
+    fn what_the_runtime_runs_for_itself_draws_nothing() {
+        let mut app = app_on_memory();
+        app.begin_turn();
+        let probe = plumbing(
+            "exec",
+            "",
+            r#"{"argv":["sh","-c","pid=$(cat \"$1.pid\") || exit 1","sh","/t"],"env":{}}"#,
+        );
+        app.op_started(&probe);
+        app.op_finished(&probe, &Ok(exec_reply(0, "20213\n").into_bytes()));
+        let offload = plumbing("write", "/w/runs/x/tool-output/1", "");
+        app.op_started(&offload);
+        app.op_finished(&offload, &Ok(Vec::new()));
+        let read = plumbing("read", "/w/a.txt", "");
+        app.op_started(&read);
+        app.op_finished(&read, &Ok(b"bytes".to_vec()));
+        let scan = plumbing("fileop", "", r#"{"workspace":"/w"}"#);
+        app.op_started(&scan);
+        app.op_finished(&scan, &Ok(b"{}".to_vec()));
+        assert_eq!(
+            transcript(&mut app),
+            "",
+            "no probe, offload, read-back or change scan draws a row"
+        );
+        app.end_turn(false);
+        assert!(
+            !transcript(&mut app).contains("Completed"),
+            "and none of them counts as a step"
+        );
+    }
+
+    #[test]
+    fn the_bottom_line_keeps_the_turns_clock_while_an_op_runs() {
+        let mut app = app_on_memory();
+        app.begin_turn();
+        labelled(&mut app, "Running the tests", "c1");
+        let mut op = asked("exec", "exec", r#"{"argv":["make","test"]}"#);
+        op.call_id = "c1".to_string();
+        app.op_started(&op);
+        let line = app.activity_line(80).to_string();
+        assert!(
+            line.contains(SPINNER_FRAMES[0]) && line.contains("Running the tests"),
+            "the turn spinner and the latest label stay while the op runs: {line}"
+        );
+        assert!(
+            !line.contains("⏺"),
+            "the running op's row lives in the transcript: {line}"
+        );
+        assert!(transcript(&mut app).contains("⏺ Running the tests"));
+    }
+
+    #[test]
+    fn the_prompt_keeps_a_spinner_for_the_work_the_turn_left_running() {
+        let mut app = app_on_memory();
+        app.begin_turn();
+        app.end_turn(true);
+        assert_eq!(app.activity_line(80).to_string(), "");
+        let began = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock")
+            .as_secs_f64()
+            - 90.0;
+        app.background(Some(("Awaiting a background task".to_string(), began)));
+        let line = app.activity_line(80).to_string();
+        assert!(
+            line.contains(SPINNER_FRAMES[0])
+                && line.contains("Awaiting a background task")
+                && line.contains("1m30s"),
+            "the wait reads as work, clocked from when it began: {line}"
+        );
+        app.background(None);
+        assert_eq!(
+            app.activity_line(80).to_string(),
+            "",
+            "a reconnect that finds the work gone clears the line"
+        );
+        app.begin_turn();
+        app.status_text("Reading the notes");
+        app.background(Some(("Awaiting a background task".to_string(), began)));
+        assert!(
+            app.activity_line(80)
+                .to_string()
+                .contains("Reading the notes"),
+            "a turn in flight keeps its own line"
+        );
+    }
+
+    #[test]
+    fn a_drained_message_stands_under_the_work_that_came_before_it() {
+        let mut app = app_on_memory();
+        app.begin_turn();
+        labelled(&mut app, "Reading the notes", "");
+        app.push_queued("while the turn ran");
+        app.sent_ack("while the turn ran", "arr-9");
+        app.frame("absorbed", r#"{"arrivals":["arr-9"]}"#);
+        labelled(&mut app, "Answering", "");
+        message(&mut app, "Here it is.");
+        let document = transcript(&mut app);
+        let before = document.find("Reading the notes").expect("the first step");
+        let echoed = document
+            .find("while the turn ran")
+            .expect("the echoed message");
+        let after = document.find("Answering").expect("the second step");
+        assert!(before < echoed && echoed < after, "{document}");
+    }
+
+    #[test]
+    fn a_prompt_a_choice_and_a_secret_each_take_the_focus() {
+        let mut app = app_on_memory();
+        app.choose(
+            "which one?",
+            &["first".to_string(), "second".to_string()],
+            false,
+        );
+        assert!(matches!(app.focus, Focus::Choose));
+        assert!(app.chooser.is_some());
+        app.secret_begin("paste the key");
+        assert!(matches!(app.focus, Focus::Secret));
+        assert!(app.collecting_secret());
+        app.ask_prompt("your turn");
+        assert!(matches!(app.focus, Focus::Compose));
+        assert_eq!(app.prompt, "your turn");
+        app.ask_prompt("");
+        assert_eq!(
+            app.prompt, PROMPT_IDLE,
+            "an empty ask restores the idle prompt"
+        );
+    }
+
+    #[test]
+    fn an_acknowledged_send_settles_when_the_turn_absorbs_it() {
+        let mut app = app_on_memory();
+        app.push_queued("while the turn ran");
+        app.sent_ack("while the turn ran", "arr-9");
+        assert_eq!(app.queued[0].arrival.as_deref(), Some("arr-9"));
+        app.absorbed(&["arr-9".to_string()]);
+        assert!(app.queued.is_empty(), "the absorbed row leaves the queue");
+        assert_eq!(members(&mut app), vec!["while the turn ran"]);
+    }
+
+    #[test]
+    fn an_absorb_that_outran_its_ack_settles_the_row_once() {
+        let mut app = app_on_memory();
+        app.push_queued("raced");
+        app.absorbed(&["arr-9".to_string()]);
+        assert_eq!(
+            app.queued.len(),
+            1,
+            "nothing settles before its ack arrives"
+        );
+        assert_eq!(app.early_absorbed, vec!["arr-9".to_string()]);
+        app.sent_ack("raced", "arr-9");
+        assert!(
+            app.queued.is_empty(),
+            "the late ack settles the row at once"
+        );
+        assert!(app.early_absorbed.is_empty(), "the parked id is consumed");
+        assert_eq!(members(&mut app), vec!["raced"]);
+    }
+
+    #[test]
+    fn parked_arrivals_never_grow_without_bound() {
+        let mut app = app_on_memory();
+        let ids: Vec<String> = (0..EARLY_ABSORBED_MAX + 8)
+            .map(|n| format!("arr-{n}"))
+            .collect();
+        app.absorbed(&ids);
+        assert_eq!(app.early_absorbed.len(), EARLY_ABSORBED_MAX);
+        assert_eq!(
+            app.early_absorbed.first().map(String::as_str),
+            Some("arr-8"),
+            "the oldest parked ids are the ones dropped"
+        );
+    }
+
+    #[test]
+    fn a_recall_waits_for_the_send_to_be_acknowledged() {
+        let mut app = app_on_memory();
+        app.push_queued("not yet sent");
+        assert!(matches!(app.recall_queued(), Reply::None));
+        assert!(
+            app.flash
+                .as_ref()
+                .is_some_and(|(said, _)| said.contains("Still sending")),
+            "the member is told the send is still in flight"
+        );
+        app.sent_ack("not yet sent", "arr-1");
+        let reply = app.recall_queued();
+        assert!(
+            matches!(&reply, Reply::Recall { text, arrival_id } if text == "not yet sent" && arrival_id == "arr-1")
+        );
+        assert!(app.queued[0].retracting);
+        assert!(
+            matches!(app.recall_queued(), Reply::None),
+            "a row already being recalled is not recalled twice"
+        );
+    }
+
+    #[test]
+    fn a_granted_recall_puts_the_words_back_in_the_composer() {
+        let mut app = app_on_memory();
+        app.push_queued("take it back");
+        app.sent_ack("take it back", "arr-1");
+        app.retracted("take it back", "arr-1", true);
+        assert!(app.queued.is_empty());
+        assert_eq!(app.ask.text, "take it back");
+        assert_eq!(app.ask.cursor, app.ask.text.len());
+    }
+
+    #[test]
+    fn a_recall_the_turn_beat_leaves_the_row_where_it_was() {
+        let mut app = app_on_memory();
+        app.push_queued("too late");
+        app.sent_ack("too late", "arr-1");
+        app.recall_queued();
+        app.retracted("too late", "arr-1", false);
+        assert_eq!(
+            app.queued.len(),
+            1,
+            "the row stays; the turn owns the words"
+        );
+        assert!(!app.queued[0].retracting, "and it can be recalled again");
+        assert!(app
+            .flash
+            .as_ref()
+            .is_some_and(|(said, _)| said.contains("Already picked up")));
+        app.retracted("nothing here", "arr-unknown", true);
+        assert_eq!(
+            app.queued.len(),
+            1,
+            "an answer naming no queued row changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_recall_joins_what_the_member_has_since_typed() {
+        let mut app = app_on_memory();
+        app.push_queued("first words");
+        app.sent_ack("first words", "arr-1");
+        app.ask.text = "second words".to_string();
+        app.retracted("first words", "arr-1", true);
+        assert_eq!(app.ask.text, "first words\n\nsecond words");
+    }
+
+    #[test]
+    fn a_send_the_turn_already_holds_settles_exactly_once() {
+        let mut app = app_on_memory();
+        app.push_queued("retried delivery");
+        app.settle_queued("retried delivery");
+        assert!(app.queued.is_empty());
+        assert_eq!(members(&mut app), vec!["retried delivery"]);
+        app.settle_queued("retried delivery");
+        assert_eq!(
+            members(&mut app),
+            vec!["retried delivery"],
+            "a row an absorb already settled stays settled"
+        );
+    }
+
+    #[test]
+    fn an_ended_turn_keeps_the_row_of_a_call_still_running() {
+        let mut app = app_on_memory();
+        app.begin_turn();
+        app.op_started(&asked("exec", "exec", r#"{"argv":["make"]}"#));
+        assert!(transcript(&mut app).contains("⏺ $ make"));
+        app.end_turn(false);
+        assert!(!app.is_working());
+        app.retained.toggle_steps();
+        assert!(
+            transcript(&mut app).contains("⏺ $ make · stopped"),
+            "a turn that ended stops what it was running"
+        );
+    }
+
+    #[test]
+    fn an_app_paints_into_the_sink_it_was_given() {
+        let mut app = app_on_memory();
+        app.say("hello there");
+        app.begin_turn();
+        assert!(app.is_working(), "a begun turn is working");
+        app.end_turn(false);
+        assert!(!app.is_working(), "an ended turn is not");
+        app.splice_raw("\x1b]52;c;YWJj\x07");
+        let painted = String::from_utf8_lossy(app.screen.written()).into_owned();
+        assert!(
+            painted.contains("\x1b]52;c;YWJj\x07"),
+            "a spliced sequence reaches the given sink, never the process's own terminal"
+        );
+        assert!(
+            painted.contains("\x1b[?1049h"),
+            "the screen entered the alternate buffer of the sink it was handed: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn a_hyperlink_survives_highlight_whole() {
+        let lit = highlight_columns(shared_line(), 8, 9);
+        let joined: String = lit.spans.iter().map(|span| span.content.as_ref()).collect();
+        let original: String = shared_line()
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(joined, original);
+        for span in &lit.spans {
+            let opens = span.content.matches('\x1b').count();
+            let closes = span.content.matches('\x07').count();
+            assert_eq!(
+                opens, closes,
+                "escape torn across spans: {:?}",
+                span.content
+            );
+        }
+    }
+
+    #[test]
+    fn highlight_lands_on_visible_columns() {
+        let lit = highlight_columns(shared_line(), 7, 11);
+        let reversed: String = lit
+            .spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|span| visible(&span.content))
+            .collect();
+        assert_eq!(reversed, "name");
+    }
+
+    #[test]
+    fn highlight_pads_past_the_visible_width() {
+        let lit = highlight_columns(shared_line(), 0, 30);
+        let width: usize = lit
+            .spans
+            .iter()
+            .map(|span| wrap::width(&visible(&span.content)))
+            .sum();
+        assert_eq!(width, 30);
+    }
+
+    fn listed(id: &str, title: &str, postable: bool) -> ConversationRow {
+        ConversationRow {
+            id: id.to_string(),
+            title: title.to_string(),
+            surface: "slack".to_string(),
+            surface_label: Some("#eng".to_string()),
+            speaker: None,
+            agent: "assistant".to_string(),
+            main: true,
+            last_at: 0.0,
+            postable,
+            channel: None,
+            turn: Turn::Idle,
+            unread: false,
+        }
+    }
+
+    #[test]
+    fn a_turn_ending_under_the_page_waits_behind_it() {
+        let mut app = app_on_memory();
+        app.begin_turn();
+        app.open_conversations(true);
+        app.conversations_loaded(1, Ok(vec![listed("c1", "Who owns the pager", true)]));
+        message(&mut app, "the reply");
+        app.end_turn(true);
+        app.ask_prompt(">");
+        assert_eq!(
+            app.focus,
+            Focus::Conversations,
+            "the reply is news, not a reason to leave"
+        );
+        app.paint();
+        let painted = String::from_utf8_lossy(app.screen.written()).to_string();
+        assert!(painted.contains("UFO Chats"), "{painted}");
+        app.close_conversations();
+        assert_eq!(app.focus, Focus::Compose);
+        assert_eq!(
+            app.prompt, PROMPT_IDLE,
+            "the server's bare prompt is the idle one"
+        );
+
+        app.open_conversations(true);
+        app.choose("Pick one", &["a".to_string(), "b".to_string()], false);
+        assert_eq!(app.focus, Focus::Conversations);
+        app.close_conversations();
+        assert_eq!(app.focus, Focus::Choose);
+    }
+
+    #[test]
+    fn a_row_wider_than_the_screen_is_cut_at_its_edge() {
+        let mut app = app_on_memory();
+        let line = Line::from(vec![
+            Span::styled("abc", app.theme.member),
+            Span::raw("defgh"),
+        ]);
+        let cut = clip_line(&line, 5);
+        assert_eq!(cut.to_string(), "abcde");
+        assert_eq!(cut.spans[0].style, app.theme.member);
+        let cols = app.cols as usize;
+        app.note(&"n".repeat(cols + 200));
+        app.paint();
+        let painted = String::from_utf8_lossy(app.screen.written()).to_string();
+        assert!(painted.contains(&"n".repeat(cols)), "the note is drawn");
+        assert!(
+            !painted.contains(&"n".repeat(cols + 1)),
+            "and cut where the screen ends"
+        );
+    }
+
+    #[test]
+    fn a_link_costs_no_columns_and_stays_closed_past_the_cut() {
+        let url = "https://github.com/acme/repo/pull/1892/with/a/tail/that/runs/on/and/on";
+        let label = format!("{}PR #1892{}", osc::link_open(url), osc::LINK_CLOSE);
+        let linked = Line::from(vec![Span::raw(label.clone()), Span::raw("x".repeat(10))]);
+        assert_eq!(painted_width(&linked), 18);
+        assert_eq!(clip_line(&linked, 10).to_string(), format!("{label}xx"));
+        assert_eq!(
+            clip_line(&linked, 3).to_string(),
+            format!("{}PR {}", osc::link_open(url), osc::LINK_CLOSE)
+        );
+        let pr = Pr {
+            number: 1892,
+            url: url.to_string(),
+        };
+        let (footer, _) = status::footer(
+            &Theme::for_mode(ColorMode::TrueColor, theme::Scheme::Dark),
+            80,
+            "acme.ufo.dev",
+            "general",
+            Some(&pr),
+            Some(status::LIST_HINT),
+        );
+        assert_eq!(
+            painted_width(&footer),
+            80,
+            "a linked footer fills its row whole"
+        );
+    }
+
+    fn page_text(app: &App<Vec<u8>>) -> String {
+        let page = app.conversations.as_ref().expect("the page is up");
+        page.render(&app.theme, 80, 24)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_page_opens_on_the_list_it_last_showed_here_and_in_the_next_process() {
+        let home = scratch_home();
+        let mut app = app_at(home.clone(), "ufo.test", "host.1");
+        app.open_conversations(false);
+        assert!(page_text(&app).contains("Loading…"), "nothing to show yet");
+        app.conversations_loaded(1, Ok(vec![listed("c1", "Who owns the pager", true)]));
+        app.close_conversations();
+        app.open_conversations(false);
+        let shown = page_text(&app);
+        assert!(shown.contains("Who owns the pager"), "{shown}");
+        assert!(!shown.contains("Loading…"), "{shown}");
+        drop(app);
+
+        let mut next = app_at(home.clone(), "ufo.test", "host.1");
+        next.open_conversations(false);
+        assert!(
+            page_text(&next).contains("Who owns the pager"),
+            "the stored list opens the page"
+        );
+        let mut elsewhere = app_at(home, "ufo.test", "host.2");
+        elsewhere.open_conversations(false);
+        assert!(
+            page_text(&elsewhere).contains("Loading…"),
+            "another sign-in's list stays unread"
+        );
+    }
+
+    #[test]
+    fn a_tick_under_the_page_turns_a_working_rows_spinner() {
+        let mut app = app_on_memory();
+        app.open_conversations(true);
+        let mut working = listed("c1", "list files", true);
+        working.turn = Turn::Running;
+        app.conversations_loaded(1, Ok(vec![working]));
+        let frame = |app: &App<Vec<u8>>| {
+            let page = app.conversations.as_ref().expect("the page is up");
+            page.render(&app.theme, 80, 24)[1].spans[1]
+                .content
+                .to_string()
+        };
+        assert_eq!(frame(&app), SPINNER_FRAMES[0]);
+        app.tick();
+        assert_eq!(frame(&app), SPINNER_FRAMES[1]);
+    }
+
+    #[test]
+    fn left_on_an_empty_composer_opens_the_conversation_page_and_a_pick_names_the_row() {
+        let mut app = app_on_memory();
+        assert_eq!(app.on_key(key(KeyCode::Left)), Reply::OpenConversations);
+        typed(&mut app, "draft");
+        assert_eq!(app.on_key(key(KeyCode::Left)), Reply::None);
+        assert_eq!(
+            app.ask.cursor,
+            "draf".len(),
+            "a draft keeps Left as cursor motion"
+        );
+        let fetch = app.open_conversations(true);
+        assert_eq!(fetch.generation, 1);
+        assert_eq!(fetch.search, "");
+        assert!(app.ask.text.is_empty(), "the page's entry starts empty");
+        app.conversations_loaded(
+            1,
+            Ok(vec![
+                listed("c1", "Who owns the pager", true),
+                listed("c2", "Deploy plan", true),
+            ]),
+        );
+        app.paint();
+        let painted = String::from_utf8_lossy(app.screen.written()).to_string();
+        assert!(painted.contains("UFO Chats"), "{painted}");
+        assert!(painted.contains("Deploy plan"), "{painted}");
+        assert!(painted.contains("Search \u{203a}"), "{painted}");
+        assert!(painted.contains("New chat ❯"), "{painted}");
+        assert!(painted.contains("ufo.test"), "the footer stays: {painted}");
+        let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        assert!(
+            painted.contains(&version),
+            "the mark heads the page: {painted}"
+        );
+        app.on_key(key(KeyCode::Up));
+        typed(&mut app, "deploy");
+        let picked = app.on_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&picked, Reply::Open(row) if row.id == "c2"),
+            "{picked:?}"
+        );
+    }
+
+    #[test]
+    fn typing_in_the_entry_bar_starts_a_new_chat_and_the_draft_waits_behind() {
+        let mut app = app_on_memory();
+        typed(&mut app, "half a thought");
+        app.open_conversations(true);
+        assert!(app.ask.text.is_empty());
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Reply::None,
+            "an empty entry sends nothing"
+        );
+        typed(&mut app, "hello there");
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Reply::NewChat("hello there".to_string())
+        );
+        assert!(app.ask.text.is_empty());
+        typed(&mut app, "kept");
+        app.close_conversations();
+        assert_eq!(
+            app.ask.text, "half a thought",
+            "the conversation's draft returns"
+        );
+        assert_eq!(app.focus, Focus::Compose);
+    }
+
+    #[test]
+    fn a_click_on_the_page_opens_the_row_under_it() {
+        let mut app = app_on_memory();
+        app.open_conversations(false);
+        app.conversations_loaded(1, Ok(vec![listed("c1", "Who owns the pager", true)]));
+        app.paint();
+        let top = masthead::masthead(&app.theme, app.cols).len() as u16;
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: top + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(app.on_mouse(press), Reply::Open(row) if row.id == "c1"));
+        let above = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(app.on_mouse(above), Reply::None);
+        let (search_row, entry_rows) = app.page_hit.clone().expect("the dock was painted");
+        let on_search = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: search_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(app.on_mouse(on_search), Reply::None);
+        typed(&mut app, "pag");
+        assert!(
+            app.ask.text.is_empty(),
+            "typing after a click on the search line searches"
+        );
+        let on_entry = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: entry_rows.start,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(app.on_mouse(on_entry), Reply::None);
+        typed(&mut app, "hi");
+        assert_eq!(app.ask.text, "hi");
+    }
+
+    #[test]
+    fn a_click_on_the_footer_hint_opens_the_page_and_the_page_carries_none() {
+        let mut app = app_on_memory();
+        app.paint();
+        let (row, columns) = app.list_hit.clone().expect("the footer carries the hint");
+        let painted = String::from_utf8_lossy(app.screen.written()).to_string();
+        assert!(painted.contains(status::LIST_HINT), "{painted}");
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: columns.start as u16,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(app.on_mouse(press), Reply::OpenConversations);
+        app.open_conversations(true);
+        app.paint();
+        assert_eq!(app.list_hit, None, "the page's footer carries no hint");
+    }
+
+    #[test]
+    fn esc_leaves_the_page_for_the_conversation_or_exits_without_one() {
+        let mut app = app_on_memory();
+        app.open_conversations(true);
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Reply::CloseConversations);
+        assert_eq!(app.focus, Focus::Compose);
+        app.open_conversations(false);
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Reply::Exit);
+    }
+
+    #[test]
+    fn a_reset_starts_a_bare_transcript_and_a_read_only_one_takes_no_message() {
+        let mut app = app_on_memory();
+        app.begin_turn();
+        message(&mut app, "an old reply");
+        app.end_turn(false);
+        typed(&mut app, "half a thought");
+        app.reset_conversation("#eng".to_string(), Some("Slack".to_string()));
+        assert_eq!(app.channel, "#eng");
+        assert!(app.ask.text.is_empty());
+        assert!(!transcript(&mut app).contains("an old reply"));
+        typed(&mut app, "hello");
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Reply::None);
+        assert!(
+            app.ask.text.is_empty(),
+            "a read-only conversation takes no draft"
+        );
+        app.paint();
+        let painted = String::from_utf8_lossy(app.screen.written()).to_string();
+        assert!(
+            painted.contains("Reply in Slack to continue it."),
+            "{painted}"
+        );
+        assert_eq!(app.on_key(key(KeyCode::Left)), Reply::OpenConversations);
+        app.reset_conversation("abc".to_string(), None);
+        typed(&mut app, "hello");
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Reply::Send("hello".to_string())
+        );
+    }
+}

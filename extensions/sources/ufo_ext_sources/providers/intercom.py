@@ -1,0 +1,369 @@
+"""The Intercom connector — conversations, contacts, companies, and their siblings synced into
+recallable pages.
+
+Intercom exposes three pagination shapes, dispatched on stream name in `paginate`: the search API
+(POST `/conversations|contacts|tickets/search`, whose body carries a `pagination.starting_after`
+cursor and a `query` filtering `updated_at > cursor`), the scroll API (GET `/companies/scroll`,
+resumed by the `scroll_param` a page returns), and the plain list API (GET `/admins|tags|teams|
+segments`, a single response). A conversation answers its parts nested in its own detail record,
+and a part is unique account-wide where a segment is unique only inside its company, which is what
+`key_scope` states on each. Auth layers an `Intercom-Version` header on whichever client the base
+built from the resolved `Credential`.
+
+Intercom orders its `updated_at` watermark as Unix seconds and stores it as decimal text. A refusal
+(HTTP 401/403) raises `StreamSkipped` so the run records a skip. The write path is intentionally
+absent — the source seam only reads."""
+
+from collections.abc import AsyncIterator, Mapping
+from functools import partial
+from typing import Any, Literal
+
+import httpx
+
+from ufo.sdk.authproxy import Credential
+from ufo.sdk.sources import (
+    ParentEdge,
+    Partition,
+    PartitionBound,
+    RestConnector,
+    Run,
+    StreamPage,
+    StreamSkipped,
+    StreamSpec,
+    WalkPage,
+    fanned_out,
+    records_at,
+)
+from ufo_ext_sources.watermark import integer_checkpoint
+
+PAGE_LIMIT = 150
+INTERCOM_VERSION = "2.11"
+_REFUSAL_STATUS = frozenset({401, 403})
+
+_SEARCH_PATHS: dict[str, str] = {
+    "conversations": "/conversations/search",
+    "contacts": "/contacts/search",
+    "tickets": "/tickets/search",
+}
+_SEARCH_RECORD_KEYS: dict[str, str] = {
+    "conversations": "conversations",
+    "contacts": "data",
+    "tickets": "tickets",
+}
+_LIST_PATHS: dict[str, str] = {
+    "admins": "/admins",
+    "tags": "/tags",
+    "teams": "/teams",
+    "segments": "/segments",
+}
+_ATTRIBUTE_MODELS: dict[str, str] = {
+    "company_attributes": "company",
+    "contact_attributes": "contact",
+}
+_CHILD_RECORD_PATHS: dict[str, str] = {
+    "company_segments": "data",
+    "conversation_parts": "conversation_parts.conversation_parts",
+}
+
+
+def _stream(
+    name: str,
+    *,
+    source_object: str | None = None,
+    primary_key: str = "id",
+    cursor_field: str | None = "updated_at",
+    canonical: bool = False,
+    parent: str | None = None,
+    path: str | None = None,
+    carry: dict[str, str] | None = None,
+    refan: Literal["on_parent_change"] | None = None,
+    key_scope: Literal["local", "global"] = "local",
+) -> StreamSpec:
+    if (parent is None) != (path is None):
+        raise ValueError(f"intercom: stream {name!r} names a parent without a path, or the reverse")
+    return StreamSpec(
+        name=name,
+        source_object=source_object or name,
+        primary_key=primary_key,
+        cursor_field=cursor_field,
+        canonical=canonical,
+        parents=()
+        if parent is None or path is None
+        else (ParentEdge(stream=parent, path=path, carry=carry or {}, refan=refan),),
+        key_scope=key_scope,
+    )
+
+
+INTERCOM_STREAMS: list[StreamSpec] = [
+    _stream("conversations", canonical=True),
+    _stream(
+        "conversation_parts",
+        canonical=True,
+        parent="conversations",
+        path="/conversations/{id}",
+        carry={"conversation_id": "id"},
+        refan="on_parent_change",
+        key_scope="global",
+    ),
+    _stream("contacts", source_object="contact", canonical=True),
+    _stream("companies", source_object="company", canonical=True),
+    _stream("admins", cursor_field=None),
+    _stream("activity_logs", cursor_field="created_at"),
+    _stream("tags", cursor_field=None),
+    _stream("teams", cursor_field=None),
+    _stream("segments"),
+    _stream(
+        "company_attributes",
+        source_object="company",
+        cursor_field=None,
+    ),
+    _stream(
+        "contact_attributes",
+        source_object="contact",
+        cursor_field=None,
+    ),
+    _stream("company_segments", parent="companies", path="/companies/{id}/segments"),
+    _stream("tickets", canonical=True),
+]
+
+
+class IntercomConnector(RestConnector):
+    name = "intercom"
+    base_url = "https://api.intercom.io"
+    streams_list = INTERCOM_STREAMS
+    checkpoint = staticmethod(integer_checkpoint)
+
+    def record_identity(self, record: Mapping[str, Any], stream: StreamSpec) -> str | None:
+        if stream.name not in _ATTRIBUTE_MODELS:
+            return super().record_identity(record, stream)
+        value = record.get("id") or record.get("full_name")
+        return str(value) if isinstance(value, (str, int)) else None
+
+    def record_ref(self, record: Mapping[str, Any], stream: StreamSpec) -> str | None:
+        if stream.name not in {"tags", "teams", *_ATTRIBUTE_MODELS}:
+            return super().record_ref(record, stream)
+        value = record.get("name")
+        return str(value) if isinstance(value, (str, int)) else None
+
+    def _make_client(self, base_url: str, credential: Credential) -> httpx.AsyncClient:
+        client = super()._make_client(base_url, credential)
+        client.headers["Intercom-Version"] = INTERCOM_VERSION
+        return client
+
+    @staticmethod
+    def _build_search_body(
+        stream: StreamSpec,
+        cursor: str | None,
+        starting_after: str | None,
+    ) -> dict[str, Any]:
+        """Intercom rejects the cursor value as a string, so it is sent as a JSON number."""
+        body: dict[str, Any] = {
+            "pagination": {"per_page": PAGE_LIMIT},
+            "sort": {"field": stream.cursor_field or "updated_at", "order": "ascending"},
+        }
+        if starting_after:
+            body["pagination"]["starting_after"] = starting_after
+        if cursor and stream.cursor_field:
+            try:
+                cursor_value: int | str = int(cursor)
+            except (TypeError, ValueError):
+                cursor_value = cursor
+            body["query"] = {
+                "field": stream.cursor_field,
+                "operator": ">",
+                "value": cursor_value,
+            }
+        else:
+            body["query"] = {
+                "field": stream.cursor_field or "updated_at",
+                "operator": ">",
+                "value": 0,
+            }
+        return body
+
+    @staticmethod
+    def _first(value: Any) -> dict[str, Any] | None:
+        """Pick the first dict out of `{ <key>.<key>: [ {...}, ... ] }`."""
+        if isinstance(value, list) and value:
+            head = value[0]
+            return head if isinstance(head, dict) else None
+        return None
+
+    @classmethod
+    def _flatten_conversation(cls, record: dict[str, Any]) -> dict[str, Any]:
+        """Lift `source.{type,subject,body}` and the first associated
+        contact id so SQL transforms can reach them as flat keys."""
+        flat = dict(record)
+        source = record.get("source")
+        if isinstance(source, dict):
+            flat["source__type"] = source.get("type")
+            flat["source__subject"] = source.get("subject")
+            flat["source__body"] = source.get("body")
+        contacts = record.get("contacts")
+        if isinstance(contacts, dict):
+            first = cls._first(contacts.get("contacts"))
+            if first is not None:
+                flat["requester_id"] = first.get("id")
+        return flat
+
+    @classmethod
+    def _flatten_conversation_part(cls, record: dict[str, Any]) -> dict[str, Any]:
+        """Surface `author.{type,id}` as flat `author_type` / `author_id`. The `conversation_id`
+        the fan-out stamped is already flat — keep it untouched."""
+        flat = dict(record)
+        author = record.get("author")
+        if isinstance(author, dict):
+            flat["author_type"] = author.get("type")
+            flat["author_id"] = author.get("id")
+        return flat
+
+    @classmethod
+    def _flatten_contact(cls, record: dict[str, Any]) -> dict[str, Any]:
+        """Lift the first associated company id to `org_id`."""
+        flat = dict(record)
+        companies = record.get("companies")
+        if isinstance(companies, dict):
+            first = cls._first(companies.get("companies"))
+            if first is not None:
+                flat["org_id"] = first.get("id") or first.get("company_id")
+        return flat
+
+    def flatten(self, record: dict[str, Any], stream: StreamSpec) -> dict[str, Any]:
+        """Lift each stream's envelope fields onto flat keys."""
+        if stream.name == "conversations":
+            record = self._flatten_conversation(record)
+        elif stream.name == "conversation_parts":
+            record = self._flatten_conversation_part(record)
+        elif stream.name == "contacts":
+            record = self._flatten_contact(record)
+        return record
+
+    async def paginate(
+        self, client: httpx.AsyncClient, stream: StreamSpec, run: Run
+    ) -> AsyncIterator[list[dict[str, Any]] | StreamPage]:
+        try:
+            async for page in self._stream_pages(client, stream, run):
+                yield page
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code in _REFUSAL_STATUS:
+                raise StreamSkipped(
+                    f"intercom: {stream.name!r} refused ({error.response.status_code}); the grant "
+                    "lacks the scope"
+                ) from error
+            raise
+
+    def _stream_pages(
+        self, client: httpx.AsyncClient, stream: StreamSpec, run: Run
+    ) -> AsyncIterator[list[dict[str, Any]] | StreamPage]:
+        name = stream.name
+        if stream.parents:
+            pages = partial(self._partition_pages, client, stream)
+            return fanned_out(stream, run, pages)
+        if name in _SEARCH_PATHS:
+            return self._paginate_search(client, stream, cursor=run.cursor)
+        if name == "companies":
+            return self._paginate_scroll(client)
+        if name in _LIST_PATHS:
+            return self._paginate_list(client, stream)
+        if name in _ATTRIBUTE_MODELS:
+            return self._paginate_attributes(client, stream)
+        if name == "activity_logs":
+            return self._paginate_activity_logs(client, cursor=run.cursor)
+        raise NotImplementedError(f"intercom: no pagination strategy for stream {name!r}")
+
+    async def _partition_pages(
+        self,
+        client: httpx.AsyncClient,
+        stream: StreamSpec,
+        partition: Partition,
+        bound: PartitionBound,
+    ) -> AsyncIterator[WalkPage]:
+        data = await self._get(client, partition.path)
+        yield WalkPage(records=records_at(data, _CHILD_RECORD_PATHS[stream.name]))
+
+    async def _paginate_search(
+        self,
+        client: httpx.AsyncClient,
+        stream: StreamSpec,
+        *,
+        cursor: str | None,
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        path = _SEARCH_PATHS[stream.name]
+        record_key = _SEARCH_RECORD_KEYS[stream.name]
+        starting_after: str | None = None
+        while True:
+            body = self._build_search_body(stream, cursor, starting_after)
+            data = await self._post(client, path, json=body)
+            records = data.get(record_key) or []
+            if records:
+                yield records
+            pages = data.get("pages") or {}
+            nxt = pages.get("next") or {}
+            starting_after = nxt.get("starting_after") if isinstance(nxt, dict) else None
+            if not starting_after:
+                return
+
+    async def _paginate_scroll(
+        self,
+        client: httpx.AsyncClient,
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        scroll_param: str | None = None
+        while True:
+            params = {"scroll_param": scroll_param} if scroll_param else None
+            data = await self._get(client, "/companies/scroll", params=params)
+            records = data.get("data") or []
+            if not records:
+                return
+            yield records
+            scroll_param = data.get("scroll_param")
+            if not scroll_param:
+                return
+
+    async def _paginate_list(
+        self,
+        client: httpx.AsyncClient,
+        stream: StreamSpec,
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        path = _LIST_PATHS[stream.name]
+        data = await self._get(client, path)
+        for key in (stream.name, "data"):
+            recs = data.get(key)
+            if isinstance(recs, list):
+                if recs:
+                    yield recs
+                return
+
+    async def _paginate_attributes(
+        self,
+        client: httpx.AsyncClient,
+        stream: StreamSpec,
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        model = _ATTRIBUTE_MODELS[stream.name]
+        data = await self._get(client, "/data_attributes", params={"model": model})
+        recs = [rec for rec in data.get("data") or [] if isinstance(rec, dict)]
+        if recs:
+            yield recs
+
+    async def _paginate_activity_logs(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        cursor: str | None,
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        params: dict[str, Any] = {}
+        if cursor:
+            params["created_at_after"] = cursor
+        next_path: str | None = "/admins/activity_logs"
+        first = True
+        while next_path:
+            data = await self._get(client, next_path, params=params if first else None)
+            first = False
+            recs = data.get("activity_logs") or []
+            if recs:
+                yield recs
+            pages = data.get("pages") or {}
+            nxt = pages.get("next")
+            if isinstance(nxt, str) and nxt:
+                next_path = nxt.replace(self.base_url, "") if nxt.startswith("http") else nxt
+            else:
+                next_path = None

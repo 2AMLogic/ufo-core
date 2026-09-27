@@ -1,0 +1,53 @@
+"""The assistant pack: a full self-contained assistant config activated as one named pack.
+
+Activating it (config `[pack] name = "assistant"`) narrows the deploy to exactly the extensions it
+names — durable memory and recall over the base-pinned local index and OpenAI embeddings, the
+Perplexity search backend, the prefetch grounding a question in both corpora before the model
+reads it, brokered connectors (Composio's open namespace plus the Pipedream allowlist), keyed
+connectors (a workspace API key injected at the egress proxy) and MCP, web automation
+through Browser Use's hosted agent, website building, the code REPL, nested todos,
+scheduled tasks, member-authored skills, the ufo terminal surface, the session debugger, the open
+feature-flag backend,
+the OpenRouter model provider, the coding subagent, and the compaction context boundary — the
+strategy a stock deploy crosses; a deploy that wants the rollover strategy instead names it in the
+toml and bundles the `context_rollover` extension. It runs on core's own local carrier and index
+with no managed infrastructure. It bundles only extensions and adds no pack-level skills or
+onboarding of its own: each capability's tools, skills, and onboarding ride that extension's own
+manifest, so the pack is nothing but the set that comes up together."""
+
+from ufo.sdk.manifest import Pack
+
+NAME = "assistant"
+VERSION = "0.1.0"
+EXTENSIONS = (
+    "perplexity",
+    "todos",
+    "sites",
+    "scheduled_tasks",
+    "report_digest",
+    "monitors",
+    "repl",
+    "memory",
+    "rag",
+    "mcp",
+    "connectors",
+    "composio",
+    "keyed_connectors",
+    "workspace_credentials",
+    "pipedream",
+    "sources",
+    "coding",
+    "browser_use",
+    "skill_create",
+    "context_compact",
+    "index_default",
+    "embed_openai",
+    "flags_open",
+    "openrouter",
+    "ufo",
+    "debugger",
+)
+
+
+def pack() -> Pack:
+    return Pack(name=NAME, version=VERSION, extensions=EXTENSIONS)

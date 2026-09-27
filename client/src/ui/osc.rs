@@ -1,0 +1,671 @@
+use std::process::{Command, Stdio};
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+
+use crate::ui::wrap;
+
+const KITTY_CHUNK: usize = 4096;
+const NOTIFICATION_COLUMNS: usize = 120;
+const HTTP_SCHEME: &str = "http://";
+const HTTPS_SCHEME: &str = "https://";
+const KITTY_ID_CEILING: u32 = 0xffff_fffe;
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+const PNG_HEADER_LEN: usize = 24;
+const JPEG_FILL: u8 = 0xff;
+const JPEG_SOI: u8 = 0xd8;
+const JPEG_EOI: u8 = 0xd9;
+const JPEG_SOS: u8 = 0xda;
+const JPEG_TEM: u8 = 0x01;
+const JPEG_RST_FIRST: u8 = 0xd0;
+const JPEG_RST_LAST: u8 = 0xd7;
+const JPEG_SOF_FIRST: u8 = 0xc0;
+const JPEG_SOF_LAST: u8 = 0xc2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caps {
+    pub osc52: bool,
+    pub notifications: bool,
+    pub images: ImageProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageProtocol {
+    None,
+    Kitty,
+    Iterm2,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TermEnv {
+    pub term: String,
+    pub term_program: String,
+    pub tmux: bool,
+    pub wt_session: bool,
+    pub kitty_window_id: bool,
+    pub alacritty: bool,
+}
+
+impl TermEnv {
+    pub fn snapshot() -> TermEnv {
+        TermEnv {
+            term: std::env::var("TERM").unwrap_or_default(),
+            term_program: std::env::var("TERM_PROGRAM").unwrap_or_default(),
+            tmux: std::env::var_os("TMUX").is_some(),
+            wt_session: std::env::var_os("WT_SESSION").is_some(),
+            kitty_window_id: std::env::var_os("KITTY_WINDOW_ID").is_some(),
+            alacritty: std::env::var_os("ALACRITTY_WINDOW_ID").is_some()
+                || std::env::var_os("ALACRITTY_SOCKET").is_some(),
+        }
+    }
+}
+
+impl Caps {
+    pub fn detect() -> Caps {
+        caps_for(&TermEnv::snapshot())
+    }
+}
+
+pub fn caps_for(env: &TermEnv) -> Caps {
+    let none = Caps {
+        osc52: false,
+        notifications: false,
+        images: ImageProtocol::None,
+    };
+    if env.term.starts_with("screen") && !env.tmux {
+        return none;
+    }
+    let caps = match identify(env) {
+        Terminal::Kitty | Terminal::Ghostty | Terminal::WezTerm => Caps {
+            osc52: true,
+            notifications: true,
+            images: ImageProtocol::Kitty,
+        },
+        Terminal::Warp => Caps {
+            osc52: true,
+            notifications: false,
+            images: ImageProtocol::Kitty,
+        },
+        Terminal::Iterm2 => Caps {
+            osc52: true,
+            notifications: true,
+            images: ImageProtocol::Iterm2,
+        },
+        Terminal::Vscode | Terminal::Windows | Terminal::Alacritty => Caps {
+            osc52: true,
+            notifications: false,
+            images: ImageProtocol::None,
+        },
+        Terminal::Unknown => none,
+    };
+    if env.tmux {
+        return Caps {
+            notifications: false,
+            images: ImageProtocol::None,
+            ..caps
+        };
+    }
+    caps
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Terminal {
+    Kitty,
+    Ghostty,
+    WezTerm,
+    Warp,
+    Iterm2,
+    Vscode,
+    Windows,
+    Alacritty,
+    Unknown,
+}
+
+fn identify(env: &TermEnv) -> Terminal {
+    let program = env.term_program.to_ascii_lowercase();
+    let term = env.term.to_ascii_lowercase();
+    match program.as_str() {
+        "kitty" => Terminal::Kitty,
+        "ghostty" => Terminal::Ghostty,
+        "wezterm" => Terminal::WezTerm,
+        "warpterminal" => Terminal::Warp,
+        "iterm.app" => Terminal::Iterm2,
+        "vscode" => Terminal::Vscode,
+        _ if env.kitty_window_id || term.contains("kitty") => Terminal::Kitty,
+        _ if term.contains("ghostty") => Terminal::Ghostty,
+        _ if term.contains("wezterm") => Terminal::WezTerm,
+        _ if env.wt_session => Terminal::Windows,
+        _ if env.alacritty || term.contains("alacritty") => Terminal::Alacritty,
+        _ => Terminal::Unknown,
+    }
+}
+
+pub fn link_open(url: &str) -> String {
+    format!("\x1b]8;;{url}\x07")
+}
+
+pub const LINK_CLOSE: &str = "\x1b]8;;\x07";
+
+pub fn open_url(url: &str) {
+    let Some((program, args)) = browser_command(url) else {
+        return;
+    };
+    let _ = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+fn browser_command(url: &str) -> Option<(&'static str, Vec<String>)> {
+    if !url.starts_with(HTTP_SCHEME) && !url.starts_with(HTTPS_SCHEME) {
+        return None;
+    }
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    Some((program, vec![url.to_string()]))
+}
+
+pub fn copy_to_clipboard(caps: Caps, text: &str) -> String {
+    if !caps.osc52 {
+        return String::new();
+    }
+    let encoded = STANDARD.encode(text.as_bytes());
+    format!("\x1b]52;c;{encoded}\x07")
+}
+
+pub fn notification(caps: Caps, body: &str) -> String {
+    if !caps.notifications {
+        return String::new();
+    }
+    let sanitized: String = body.chars().filter(|ch| !ch.is_control()).collect();
+    let shown = wrap::clip(sanitized.trim(), NOTIFICATION_COLUMNS);
+    if shown.is_empty() {
+        return String::new();
+    }
+    format!("\x1b]9;{shown}\x07")
+}
+
+pub fn inline_image(caps: Caps, bytes: &[u8], mime: &str, max_width_cells: u16) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    match caps.images {
+        ImageProtocol::Kitty if mime.eq_ignore_ascii_case("image/png") => {
+            kitty_image(bytes, max_width_cells)
+        }
+        ImageProtocol::Iterm2 if is_image_mime(mime) => iterm2_image(bytes, max_width_cells),
+        _ => String::new(),
+    }
+}
+
+fn is_image_mime(mime: &str) -> bool {
+    mime.get(..6)
+        .is_some_and(|head| head.eq_ignore_ascii_case("image/"))
+}
+
+fn kitty_image(bytes: &[u8], max_width_cells: u16) -> String {
+    let payload = STANDARD.encode(bytes);
+    let id = image_id();
+    let columns = match max_width_cells {
+        0 => String::new(),
+        cells => format!(",c={cells}"),
+    };
+    let mut out = String::with_capacity(payload.len() + payload.len() / KITTY_CHUNK * 16 + 64);
+    let mut at = 0;
+    while at < payload.len() {
+        let end = (at + KITTY_CHUNK).min(payload.len());
+        let more = u8::from(end < payload.len());
+        let chunk = &payload[at..end];
+        if at == 0 {
+            out.push_str(&format!(
+                "\x1b_Ga=T,f=100,q=2,C=1,i={id}{columns},m={more};{chunk}\x1b\\"
+            ));
+        } else {
+            out.push_str(&format!("\x1b_Gm={more};{chunk}\x1b\\"));
+        }
+        at = end;
+    }
+    out.push('\n');
+    out
+}
+
+fn iterm2_image(bytes: &[u8], max_width_cells: u16) -> String {
+    let payload = STANDARD.encode(bytes);
+    let size = bytes.len();
+    let columns = match max_width_cells {
+        0 => String::new(),
+        cells => format!("width={cells};"),
+    };
+    format!("\x1b]1337;File=inline=1;size={size};{columns}preserveAspectRatio=1:{payload}\x07\n")
+}
+
+fn image_id() -> u32 {
+    let mut raw = [0u8; 4];
+    getrandom::fill(&mut raw).expect("os randomness is available");
+    u32::from_be_bytes(raw) % KITTY_ID_CEILING + 1
+}
+
+pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < PNG_HEADER_LEN || bytes[..8] != PNG_SIGNATURE || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = be_u32(bytes, 16);
+    let height = be_u32(bytes, 20);
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+pub fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || bytes[0] != JPEG_FILL || bytes[1] != JPEG_SOI {
+        return None;
+    }
+    let mut at = 2;
+    while at + 1 < bytes.len() {
+        if bytes[at] != JPEG_FILL {
+            return None;
+        }
+        let marker = bytes[at + 1];
+        at += 2;
+        match marker {
+            JPEG_FILL => at -= 1,
+            JPEG_TEM | JPEG_SOI | JPEG_RST_FIRST..=JPEG_RST_LAST => {}
+            JPEG_EOI | JPEG_SOS => return None,
+            JPEG_SOF_FIRST..=JPEG_SOF_LAST => {
+                if at + 7 > bytes.len() {
+                    return None;
+                }
+                let height = be_u16(bytes, at + 3);
+                let width = be_u16(bytes, at + 5);
+                return (width > 0 && height > 0).then_some((width, height));
+            }
+            _ => {
+                if at + 2 > bytes.len() {
+                    return None;
+                }
+                let length = be_u16(bytes, at) as usize;
+                if length < 2 {
+                    return None;
+                }
+                at += length;
+            }
+        }
+    }
+    None
+}
+
+fn be_u32(bytes: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+fn be_u16(bytes: &[u8], at: usize) -> u32 {
+    u32::from(bytes[at]) << 8 | u32::from(bytes[at + 1])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OFF: Caps = Caps {
+        osc52: false,
+        notifications: false,
+        images: ImageProtocol::None,
+    };
+
+    const NOTIFYING: Caps = Caps {
+        notifications: true,
+        ..OFF
+    };
+
+    fn env(term: &str, program: &str) -> TermEnv {
+        TermEnv {
+            term: term.to_string(),
+            term_program: program.to_string(),
+            ..TermEnv::default()
+        }
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = PNG_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes
+    }
+
+    fn jpeg(width: u16, height: u16) -> Vec<u8> {
+        let mut bytes = vec![0xff, JPEG_SOI, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00];
+        bytes.extend_from_slice(&[0xff, JPEG_SOF_FIRST, 0x00, 0x11, 0x08]);
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&[0x03, 0x01, 0x22, 0x00]);
+        bytes
+    }
+
+    fn kitty_escapes(out: &str) -> Vec<&str> {
+        out.trim_end_matches('\n')
+            .split("\x1b\\")
+            .filter(|part| !part.is_empty())
+            .map(|part| part.trim_start_matches("\x1b_G"))
+            .collect()
+    }
+
+    #[test]
+    fn link_markers_wrap_a_label_bel_terminated() {
+        let said = format!("{}label{}", link_open("https://x"), LINK_CLOSE);
+        assert_eq!(said, "\x1b]8;;https://x\x07label\x1b]8;;\x07");
+    }
+
+    #[test]
+    fn osc52_is_silent_when_unsupported() {
+        assert!(copy_to_clipboard(OFF, "text").is_empty());
+    }
+
+    #[test]
+    fn notification_is_silent_when_unsupported() {
+        assert!(notification(OFF, "The turn finished.").is_empty());
+    }
+
+    #[test]
+    fn notification_carries_the_body() {
+        assert_eq!(
+            notification(NOTIFYING, "The turn finished."),
+            "\x1b]9;The turn finished.\x07"
+        );
+    }
+
+    #[test]
+    fn notification_drops_control_characters() {
+        assert_eq!(
+            notification(NOTIFYING, "one\ntwo\x07three\x1b]9;x"),
+            "\x1b]9;onetwothree]9;x\x07"
+        );
+        assert!(notification(NOTIFYING, "\n\t ").is_empty());
+        assert!(notification(NOTIFYING, "").is_empty());
+    }
+
+    #[test]
+    fn notification_clips_to_one_line() {
+        let long = "x".repeat(NOTIFICATION_COLUMNS + 40);
+        assert_eq!(
+            notification(NOTIFYING, &long),
+            format!("\x1b]9;{}\x07", "x".repeat(NOTIFICATION_COLUMNS))
+        );
+        let wide = notification(NOTIFYING, &"日".repeat(NOTIFICATION_COLUMNS));
+        let body = wide.trim_start_matches("\x1b]9;").trim_end_matches('\x07');
+        assert_eq!(wrap::width(body), NOTIFICATION_COLUMNS);
+    }
+
+    #[test]
+    fn browser_command_refuses_every_other_scheme() {
+        for url in [
+            "",
+            "example.com",
+            " https://example.com",
+            "https:/example.com",
+            "file:///etc/passwd",
+            "ftp://example.com/x",
+            "javascript:alert(1)",
+            "vscode://file/etc/passwd",
+            "HTTPS://example.com",
+        ] {
+            assert!(browser_command(url).is_none(), "{url}");
+        }
+    }
+
+    #[test]
+    fn browser_command_passes_the_url_as_one_argument() {
+        let (_, args) = browser_command("https://example.com/a?b=1&c=2").unwrap();
+        assert_eq!(args, vec!["https://example.com/a?b=1&c=2".to_string()]);
+        assert!(browser_command("http://localhost:8080/x").is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_hands_off_to_open() {
+        assert_eq!(browser_command("https://example.com").unwrap().0, "open");
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn other_unix_hands_off_to_xdg_open() {
+        assert_eq!(
+            browser_command("https://example.com").unwrap().0,
+            "xdg-open"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_hands_off_to_explorer() {
+        assert_eq!(
+            browser_command("https://example.com").unwrap().0,
+            "explorer"
+        );
+    }
+
+    #[test]
+    fn detect_answers_for_the_running_terminal() {
+        let env = TermEnv::snapshot();
+        let caps = Caps::detect();
+        let matrix = caps_for(&env);
+        assert_eq!(caps.osc52, matrix.osc52);
+        assert_eq!(caps.notifications, matrix.notifications);
+        assert_eq!(caps.images, matrix.images);
+        if env.tmux {
+            assert_eq!(caps.images, ImageProtocol::None);
+        }
+    }
+
+    #[test]
+    fn kitty_terminals_speak_every_feature() {
+        let expected = Caps {
+            osc52: true,
+            notifications: true,
+            images: ImageProtocol::Kitty,
+        };
+        assert_eq!(caps_for(&env("xterm-kitty", "")), expected);
+        assert_eq!(caps_for(&env("xterm-ghostty", "ghostty")), expected);
+        assert_eq!(caps_for(&env("xterm-256color", "WezTerm")), expected);
+        let marked = TermEnv {
+            kitty_window_id: true,
+            ..env("xterm-256color", "")
+        };
+        assert_eq!(caps_for(&marked), expected);
+    }
+
+    #[test]
+    fn warp_carries_images_but_no_notifications() {
+        assert_eq!(
+            caps_for(&env("xterm-256color", "WarpTerminal")),
+            Caps {
+                osc52: true,
+                notifications: false,
+                images: ImageProtocol::Kitty,
+            }
+        );
+    }
+
+    #[test]
+    fn iterm_speaks_its_own_protocol() {
+        assert_eq!(
+            caps_for(&env("xterm-256color", "iTerm.app")),
+            Caps {
+                osc52: true,
+                notifications: true,
+                images: ImageProtocol::Iterm2,
+            }
+        );
+    }
+
+    #[test]
+    fn clipboard_only_terminals_carry_no_images() {
+        let expected = Caps {
+            osc52: true,
+            notifications: false,
+            images: ImageProtocol::None,
+        };
+        assert_eq!(caps_for(&env("xterm-256color", "vscode")), expected);
+        assert_eq!(caps_for(&env("alacritty", "")), expected);
+        let windows = TermEnv {
+            wt_session: true,
+            ..env("xterm-256color", "")
+        };
+        assert_eq!(caps_for(&windows), expected);
+        let socketed = TermEnv {
+            alacritty: true,
+            ..env("xterm-256color", "")
+        };
+        assert_eq!(caps_for(&socketed), expected);
+    }
+
+    #[test]
+    fn unknown_terminals_get_nothing() {
+        assert_eq!(caps_for(&env("xterm-256color", "")), OFF);
+        assert_eq!(caps_for(&env("", "")), OFF);
+        assert_eq!(caps_for(&env("vt100", "Apple_Terminal")), OFF);
+    }
+
+    #[test]
+    fn screen_gets_nothing() {
+        assert_eq!(caps_for(&env("screen.xterm-256color", "iTerm.app")), OFF);
+        assert_eq!(caps_for(&env("screen-256color", "")), OFF);
+    }
+
+    #[test]
+    fn tmux_drops_images_and_notifications() {
+        let under_tmux = TermEnv {
+            tmux: true,
+            ..env("screen-256color", "iTerm.app")
+        };
+        assert_eq!(
+            caps_for(&under_tmux),
+            Caps {
+                osc52: true,
+                notifications: false,
+                images: ImageProtocol::None,
+            }
+        );
+        let kitty = TermEnv {
+            tmux: true,
+            ..env("xterm-kitty", "")
+        };
+        assert_eq!(caps_for(&kitty).images, ImageProtocol::None);
+        assert!(!caps_for(&kitty).notifications);
+    }
+
+    #[test]
+    fn kitty_chunks_the_payload() {
+        let caps = Caps {
+            images: ImageProtocol::Kitty,
+            ..OFF
+        };
+        let mut bytes = png(64, 64);
+        bytes.resize(10_000, 0x5a);
+        let out = inline_image(caps, &bytes, "image/png", 40);
+        assert!(out.ends_with('\n'));
+        let escapes = kitty_escapes(&out);
+        assert!(escapes.len() > 2);
+        let (keys, payload) = escapes[0].split_once(';').unwrap();
+        assert!(keys.starts_with("a=T,f=100,q=2,C=1,i="));
+        assert!(keys.contains(",c=40"));
+        assert!(keys.ends_with(",m=1"));
+        assert!(payload.len() <= KITTY_CHUNK);
+        let id: u32 = keys
+            .split(',')
+            .find_map(|key| key.strip_prefix("i="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=KITTY_ID_CEILING).contains(&id));
+        for escape in &escapes[1..escapes.len() - 1] {
+            let (keys, payload) = escape.split_once(';').unwrap();
+            assert_eq!(keys, "m=1");
+            assert_eq!(payload.len(), KITTY_CHUNK);
+        }
+        let (keys, payload) = escapes.last().unwrap().split_once(';').unwrap();
+        assert_eq!(keys, "m=0");
+        assert!(!payload.is_empty() && payload.len() <= KITTY_CHUNK);
+        let rejoined: String = escapes
+            .iter()
+            .map(|escape| escape.split_once(';').unwrap().1)
+            .collect();
+        assert_eq!(STANDARD.decode(rejoined).unwrap(), bytes);
+    }
+
+    #[test]
+    fn kitty_sends_one_escape_for_a_small_image() {
+        let caps = Caps {
+            images: ImageProtocol::Kitty,
+            ..OFF
+        };
+        let out = inline_image(caps, &png(8, 8), "image/png", 0);
+        let escapes = kitty_escapes(&out);
+        assert_eq!(escapes.len(), 1);
+        let (keys, _) = escapes[0].split_once(';').unwrap();
+        assert!(!keys.contains("c="));
+        assert!(keys.ends_with(",m=0"));
+    }
+
+    #[test]
+    fn kitty_carries_png_alone() {
+        let caps = Caps {
+            images: ImageProtocol::Kitty,
+            ..OFF
+        };
+        assert!(inline_image(caps, b"\xff\xd8\xff\xe0", "image/jpeg", 40).is_empty());
+        assert!(inline_image(caps, b"", "image/png", 40).is_empty());
+        assert!(inline_image(OFF, &png(8, 8), "image/png", 40).is_empty());
+    }
+
+    #[test]
+    fn iterm_carries_any_image() {
+        let caps = Caps {
+            images: ImageProtocol::Iterm2,
+            ..OFF
+        };
+        let bytes = jpeg(3, 2);
+        let out = inline_image(caps, &bytes, "image/jpeg", 12);
+        let expected = format!(
+            "\x1b]1337;File=inline=1;size={};width=12;preserveAspectRatio=1:{}\x07\n",
+            bytes.len(),
+            STANDARD.encode(&bytes)
+        );
+        assert_eq!(out, expected);
+        assert!(inline_image(caps, &bytes, "application/pdf", 12).is_empty());
+        assert!(inline_image(caps, &bytes, "image/gif", 0)
+            .contains(&format!(";size={};preserveAspectRatio=1:", bytes.len())));
+    }
+
+    #[test]
+    fn png_header_gives_dimensions() {
+        assert_eq!(png_dimensions(&png(640, 480)), Some((640, 480)));
+        assert_eq!(png_dimensions(&png(0, 480)), None);
+        assert_eq!(png_dimensions(&png(640, 480)[..20]), None);
+        let mut wrong_chunk = png(640, 480);
+        wrong_chunk[13] = b'X';
+        assert_eq!(png_dimensions(&wrong_chunk), None);
+        assert_eq!(png_dimensions(b"not a png at all, truly"), None);
+        assert_eq!(png_dimensions(b""), None);
+    }
+
+    #[test]
+    fn jpeg_frame_header_gives_dimensions() {
+        assert_eq!(jpeg_dimensions(&jpeg(1920, 1080)), Some((1920, 1080)));
+        let mut progressive = jpeg(320, 240);
+        progressive[9] = 0xc2;
+        assert_eq!(jpeg_dimensions(&progressive), Some((320, 240)));
+        assert_eq!(jpeg_dimensions(&jpeg(0, 240)), None);
+        assert_eq!(jpeg_dimensions(&jpeg(64, 64)[..12]), None);
+        assert_eq!(jpeg_dimensions(&[0xff, JPEG_SOI, 0xff, JPEG_SOS]), None);
+        assert_eq!(jpeg_dimensions(&png(8, 8)), None);
+        assert_eq!(jpeg_dimensions(b""), None);
+    }
+}

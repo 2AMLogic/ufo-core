@@ -1,0 +1,167 @@
+"""The PagerDuty connector — users, teams, services, incidents, incident notes, escalation policies,
+schedules, and on-calls synced into recallable pages.
+
+PagerDuty paginates by `offset`+`limit` with the response reporting its own continuation: a `more`
+boolean says whether another page exists and a `limit` echo gives the applied page size the next
+offset advances by (`_get_offset_pages(more_path=..., response_limit_path=...)`). Incidents read
+incrementally with `?since=<cursor>` sorted by `updated_at`. A note's collection composes none of
+PagerDuty's `Pagination` schema, so it answers one unpaged page.
+Records arrive flat under a stream-named envelope key, so keying and the watermark read the raw
+fields directly. A refusal (HTTP 401/403) raises `StreamSkipped` so the run records a skip, not a
+failure. Auth pins PagerDuty's versioned media type. The credential is resolved through the auth
+proxy the runner threads — this connector holds no token. The write path is intentionally absent —
+the source seam only reads."""
+
+from collections.abc import AsyncIterator
+from functools import partial
+from typing import Any
+
+import httpx
+
+from ufo.sdk.authproxy import Credential
+from ufo.sdk.sources import (
+    ParentEdge,
+    Partition,
+    PartitionBound,
+    RestConnector,
+    Run,
+    StreamPage,
+    StreamSkipped,
+    StreamSpec,
+    WalkPage,
+    fanned_out,
+    records_at,
+)
+from ufo_ext_sources.watermark import text_checkpoint
+
+_REFUSAL_STATUS = frozenset({401, 403})
+_PAGERDUTY_ACCEPT = "application/vnd.pagerduty+json;version=2"
+
+USERS = StreamSpec(name="users", source_object="users", primary_key="id")
+TEAMS = StreamSpec(name="teams", source_object="teams", primary_key="id")
+SERVICES = StreamSpec(name="services", source_object="services", primary_key="id")
+INCIDENTS = StreamSpec(
+    name="incidents",
+    source_object="incidents",
+    primary_key="id",
+    cursor_field="updated_at",
+    updated_at_field="updated_at",
+    canonical=True,
+)
+INCIDENT_NOTES = StreamSpec(
+    name="incident_notes",
+    source_object="notes",
+    primary_key="id",
+    cursor_field="created_at",
+    updated_at_field=None,
+    parents=(ParentEdge(stream="incidents", path="/incidents/{id}/notes"),),
+)
+ESCALATION_POLICIES = StreamSpec(
+    name="escalation_policies",
+    source_object="escalation_policies",
+    primary_key="id",
+)
+SCHEDULES = StreamSpec(
+    name="schedules",
+    source_object="schedules",
+    primary_key="id",
+)
+ONCALLS = StreamSpec(name="oncalls", source_object="oncalls", primary_key="id")
+
+ALL_STREAMS = [
+    USERS,
+    TEAMS,
+    SERVICES,
+    INCIDENTS,
+    INCIDENT_NOTES,
+    ESCALATION_POLICIES,
+    SCHEDULES,
+    ONCALLS,
+]
+
+
+class PagerDutyConnector(RestConnector):
+    name = "pagerduty"
+    base_url = "https://api.pagerduty.com"
+    streams_list = ALL_STREAMS
+    checkpoint = staticmethod(text_checkpoint)
+
+    def _make_client(self, base_url: str, credential: Credential) -> httpx.AsyncClient:
+        client = super()._make_client(base_url, credential)
+        client.headers["Accept"] = _PAGERDUTY_ACCEPT
+        return client
+
+    async def _offset_pages(
+        self,
+        client: httpx.AsyncClient,
+        stream: StreamSpec,
+        *,
+        params: dict[str, Any] | None = None,
+        cursor: str | None = None,
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        async for records in self._get_offset_pages(
+            client,
+            f"/{stream.source_object}",
+            records_path=stream.source_object,
+            limit=100,
+            params=params,
+            more_path="more",
+            response_limit_path="limit",
+        ):
+            if cursor and stream.cursor_field:
+                records = [r for r in records if str(r.get(stream.cursor_field) or "") > cursor]
+            if records:
+                yield records
+
+    async def _incidents(
+        self, client: httpx.AsyncClient, *, cursor: str | None
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        params = {"sort_by": "updated_at:asc"}
+        if cursor:
+            params["since"] = cursor
+        async for page in self._offset_pages(
+            client,
+            next(s for s in self.streams_list if s.name == "incidents"),
+            params=params,
+            cursor=cursor,
+        ):
+            yield page
+
+    async def _notes(
+        self, client: httpx.AsyncClient, partition: Partition, bound: PartitionBound
+    ) -> AsyncIterator[WalkPage]:
+        data = await self._get(client, partition.path)
+        yield WalkPage(records=records_at(data, "notes"))
+
+    async def paginate(
+        self, client: httpx.AsyncClient, stream: StreamSpec, run: Run
+    ) -> AsyncIterator[list[dict[str, Any]] | StreamPage]:
+        try:
+            if stream.name == "incidents":
+                async for records in self._incidents(client, cursor=run.cursor):
+                    yield records
+                return
+            if stream.parents:
+                pages = partial(self._notes, client)
+                async for page in fanned_out(stream, run, pages):
+                    yield page
+                return
+            if stream.name in {
+                "users",
+                "teams",
+                "services",
+                "escalation_policies",
+                "schedules",
+                "oncalls",
+            }:
+                async for records in self._offset_pages(client, stream, cursor=run.cursor):
+                    yield records
+                return
+            raise StreamSkipped(f"pagerduty stream {stream.name!r} is not implemented")
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code in _REFUSAL_STATUS:
+                raise StreamSkipped(
+                    f"pagerduty: {stream.name!r} refused ({error.response.status_code}); "
+                    "the grant lacks scope or the token is invalid"
+                ) from error
+            raise

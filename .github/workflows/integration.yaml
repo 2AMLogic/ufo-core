@@ -1,0 +1,129 @@
+name: integration
+
+on:
+  workflow_call:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: integration-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  integration:
+    name: integration ${{ matrix.shard }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["1/3", "2/3", "3/3"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UFO_CLIENT_BINARY: client/target/x86_64-unknown-linux-musl/release/ufo
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: ufo
+          POSTGRES_PASSWORD: ufo
+          POSTGRES_DB: ufo
+        ports:
+          - 5541:5432
+        options: >-
+          --health-cmd "pg_isready -U ufo"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk for the sandbox image
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          docker image prune -af || true
+          df -h /
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync
+      - name: Start pulling the published sandbox image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/ufo-sandbox
+          REGISTRY_USER: ${{ github.actor }}
+        run: |
+          DOCKERFILE="$RUNNER_TEMP/sandbox.Dockerfile"
+          KEY="$(timeout 300 bash .github/scripts/sandbox_image_key.sh "$DOCKERFILE")" || KEY=""
+          if [ -n "$KEY" ] \
+            && echo "$GH_TOKEN" | timeout 60 docker login ghcr.io -u "$REGISTRY_USER" --password-stdin; then
+            (timeout 300 docker pull -q "$IMAGE_REPOSITORY:$KEY"; echo "exit=$?") \
+              >"$RUNNER_TEMP/sandbox-pull.log" 2>&1 &
+            echo "SANDBOX_PULL_PID=$!" >>"$GITHUB_ENV"
+            echo "SANDBOX_PULL_IMAGE=$IMAGE_REPOSITORY:$KEY" >>"$GITHUB_ENV"
+          else
+            echo "no published image for ${KEY:-an underivable key} — the fixture builds it"
+          fi
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - id: egress
+        uses: actions/cache@v4
+        with:
+          path: servers/egress/target/debug/ufo-egress
+          key: ufo-egress-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('servers/egress/**', '!servers/egress/target/**') }}
+      - id: client
+        uses: actions/cache@v4
+        with:
+          path: client/target/x86_64-unknown-linux-musl/release/ufo
+          key: ufo-client-musl-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('client/**', '!client/target/**') }}
+      - if: steps.egress.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: servers/egress
+      - if: steps.client.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+          key: x86_64-unknown-linux-musl
+      - if: steps.egress.outputs.cache-hit != 'true'
+        run: cargo build --manifest-path servers/egress/Cargo.toml
+      - if: steps.client.outputs.cache-hit != 'true'
+        uses: ./.github/actions/client-gh
+        with:
+          target: x86_64-unknown-linux-musl
+      - if: steps.client.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - if: steps.client.outputs.cache-hit != 'true'
+        working-directory: client
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - run: echo "$GITHUB_WORKSPACE/client/target/x86_64-unknown-linux-musl/release" >> "$GITHUB_PATH"
+      - name: Install Chrome for Testing
+        run: >-
+          npx --yes "playwright@$(uv run python -c
+          'from ufo.harness.sandbox.session import PLAYWRIGHT_VERSION; print(PLAYWRIGHT_VERSION)')"
+          install --with-deps chromium
+      - name: Reuse the published sandbox image
+        if: env.SANDBOX_PULL_IMAGE != ''
+        run: |
+          timeout 300 tail --pid="$SANDBOX_PULL_PID" -f /dev/null || true
+          if grep -qx 'exit=0' "$RUNNER_TEMP/sandbox-pull.log"; then
+            echo "UFO_SANDBOX_TEST_IMAGE=$SANDBOX_PULL_IMAGE" >>"$GITHUB_ENV"
+          else
+            cat "$RUNNER_TEMP/sandbox-pull.log"
+            echo "no published image for ${SANDBOX_PULL_IMAGE##*:} — the fixture builds it"
+          fi
+      - run: make test-integration SHARD=${{ matrix.shard }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-timings-integration-${{ strategy.job-index }}
+          path: .pytest-timings
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14

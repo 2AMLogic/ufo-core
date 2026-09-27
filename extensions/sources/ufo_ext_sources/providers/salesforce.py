@@ -1,0 +1,152 @@
+"""The Salesforce connector — the standard CRM SObject surface synced as recallable pages.
+
+Salesforce reads through SOQL Query REST: `paginate` describes the SObject to learn its full field
+list (no hand-listed schemas — the sync lands whatever the org exposes), builds
+`SELECT <fields> FROM <SObject> [WHERE SystemModstamp > <cursor>] ORDER BY SystemModstamp ASC LIMIT
+200`, GETs `/services/data/<v>/query`, and follows the absolute `nextRecordsUrl` while `done` is
+false. Once a cursor exists, a second call to `/sobjects/<obj>/deleted/` names the records
+hard-deleted since the cursor and carries them as a delete-tombstone page whose `next_cursor` is the
+window end — so a vanished record is tombstoned without a full snapshot. `flatten` drops the SObject
+`attributes` envelope so only field columns remain. The base URL is per-instance (each org sits on a
+different host), so the class default is empty and a run without a resolved instance URL fails loud.
+A refusal (401/403) raises `StreamSkipped`. The credential is resolved through the auth proxy the
+runner threads; this connector holds no token. The write path is intentionally absent — the source
+seam only reads."""
+
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from typing import Any
+
+import httpx
+
+from ufo.sdk.sources import (
+    RestConnector,
+    Run,
+    StreamPage,
+    StreamSkipped,
+    StreamSpec,
+)
+from ufo_ext_sources.watermark import text_checkpoint
+
+API_VERSION = "v60.0"
+PAGE_LIMIT = 200
+_REFUSAL_STATUS = frozenset({401, 403})
+
+
+def _stream(name: str, *, sobject: str, canonical: bool = False) -> StreamSpec:
+    return StreamSpec(
+        name=name,
+        source_object=sobject,
+        primary_key="Id",
+        cursor_field="SystemModstamp",
+        created_at_field="CreatedDate",
+        updated_at_field="SystemModstamp",
+        canonical=canonical,
+    )
+
+
+SALESFORCE_STREAMS: list[StreamSpec] = [
+    _stream("accounts", sobject="Account", canonical=True),
+    _stream("contacts", sobject="Contact", canonical=True),
+    _stream("opportunities", sobject="Opportunity", canonical=True),
+    _stream("tasks", sobject="Task", canonical=True),
+    _stream("leads", sobject="Lead", canonical=True),
+    _stream("users", sobject="User"),
+    _stream("opportunity_line_items", sobject="OpportunityLineItem"),
+    _stream("opportunity_contact_roles", sobject="OpportunityContactRole"),
+    _stream("products", sobject="Product2"),
+    _stream("pricebooks", sobject="Pricebook2"),
+    _stream("pricebook_entries", sobject="PricebookEntry"),
+    _stream("quotes", sobject="Quote"),
+    _stream("quote_line_items", sobject="QuoteLineItem"),
+    _stream("orders", sobject="Order"),
+    _stream("order_items", sobject="OrderItem"),
+    _stream("contracts", sobject="Contract", canonical=True),
+    _stream("assets", sobject="Asset"),
+    _stream("cases", sobject="Case", canonical=True),
+    _stream("case_comments", sobject="CaseComment", canonical=True),
+    _stream("solutions", sobject="Solution"),
+    _stream("campaigns", sobject="Campaign"),
+    _stream("campaign_members", sobject="CampaignMember"),
+    _stream("events", sobject="Event", canonical=True),
+    _stream("email_messages", sobject="EmailMessage", canonical=True),
+    _stream("content_notes", sobject="ContentNote", canonical=True),
+    _stream("content_documents", sobject="ContentDocument"),
+    _stream("content_versions", sobject="ContentVersion"),
+]
+
+
+class SalesforceConnector(RestConnector):
+    name = "salesforce"
+    base_url = ""
+    streams_list = SALESFORCE_STREAMS
+    checkpoint = staticmethod(text_checkpoint)
+
+    @staticmethod
+    def _build_soql(stream: StreamSpec, fields: list[str], cursor: str | None) -> str:
+        cols = ", ".join(fields)
+        where = f" WHERE {stream.cursor_field} > {cursor}" if stream.cursor_field and cursor else ""
+        order = f" ORDER BY {stream.cursor_field} ASC" if stream.cursor_field else ""
+        return f"SELECT {cols} FROM {stream.source_object}{where}{order} LIMIT {PAGE_LIMIT}"
+
+    async def _describe_fields(self, client: httpx.AsyncClient, sobject: str) -> list[str]:
+        data = await self._get(client, f"/services/data/{API_VERSION}/sobjects/{sobject}/describe")
+        return [
+            str(field["name"])
+            for field in (data.get("fields") or [])
+            if isinstance(field, dict) and field.get("name")
+        ]
+
+    async def paginate(
+        self, client: httpx.AsyncClient, stream: StreamSpec, run: Run
+    ) -> AsyncIterator[list[dict[str, Any]] | StreamPage]:
+        try:
+            fields = await self._describe_fields(client, stream.source_object)
+            soql = self._build_soql(stream, fields, run.cursor)
+            path: str | None = f"/services/data/{API_VERSION}/query"
+            params: dict[str, Any] | None = {"q": soql}
+            while path:
+                data = await self._get(client, path, params=params)
+                records = data.get("records", []) or []
+                if records:
+                    yield records
+                if data.get("done", True):
+                    break
+                path = data.get("nextRecordsUrl")
+                params = None
+            if run.cursor:
+                delete_page = await self._deleted_page(client, stream, cursor=run.cursor)
+                if delete_page is not None:
+                    yield delete_page
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code in _REFUSAL_STATUS:
+                raise StreamSkipped(
+                    f"salesforce: {stream.name!r} refused "
+                    f"({error.response.status_code}); the grant lacks scope or the key is invalid"
+                ) from error
+            raise
+
+    async def _deleted_page(
+        self, client: httpx.AsyncClient, stream: StreamSpec, *, cursor: str
+    ) -> StreamPage | None:
+        end = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        data = await self._get(
+            client,
+            f"/services/data/{API_VERSION}/sobjects/{stream.source_object}/deleted/",
+            params={"start": cursor, "end": end},
+        )
+        deletes = tuple(
+            str(record["id"])
+            for record in data.get("deletedRecords") or []
+            if isinstance(record, dict) and record.get("id")
+        )
+        latest = data.get("latestDateCovered")
+        next_cursor = latest if isinstance(latest, str) and latest else end
+        if not deletes and not next_cursor:
+            return None
+        return StreamPage(deletes=deletes, next_cursor=next_cursor)
+
+    def flatten(self, record: dict[str, Any], stream: StreamSpec) -> dict[str, Any]:
+        if "attributes" in record:
+            return {key: value for key, value in record.items() if key != "attributes"}
+        return record

@@ -1,0 +1,34 @@
+# The two services the test matrix needs, one command: `make db`. Postgres keeps the ufo:ufo
+# credentials `UFO_TEST_POSTGRES_URL` defaults to; override UFO_PG_PORT or UFO_REDIS_PORT if taken.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: ufo
+      POSTGRES_PASSWORD: ufo
+      POSTGRES_DB: ufo
+    ports:
+      # Host publish is only for host tooling and tests; override `UFO_PG_PORT` if 5541 is taken by another
+      # local Postgres.
+      - "127.0.0.1:${UFO_PG_PORT:-5541}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ufo"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:${UFO_REDIS_PORT:-5543}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  pgdata:

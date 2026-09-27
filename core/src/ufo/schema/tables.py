@@ -1,0 +1,1152 @@
+"""The one schema, dialect-neutral: SQLite (dev) and Postgres (deploys) from one metadata."""
+
+from uuid import uuid4
+
+import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine.default import DefaultExecutionContext
+
+from ufo.runtime.turns.audience import conversation_audience
+from ufo.schema.records import DEFAULT_AGENT_ICON
+
+
+def _conversation_audience(context: DefaultExecutionContext) -> str:
+    return str(conversation_audience(context.get_current_parameters().get("member_id")))
+
+
+metadata = sa.MetaData()
+
+MAX_BACKFILL_DAYS = 36500
+"""How far back a connection's first sync may reach: a century, which is every provider's whole
+history. A member who wants all of it asks for this many days, so `backfill_days` is one integer
+and never a word standing for a number."""
+
+workspace = sa.Table(
+    "workspace",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("page_revision", sa.BigInteger, nullable=False, server_default="0"),
+    sa.Column("egress_rules_generation", sa.BigInteger, nullable=False, server_default="0"),
+    sa.Column("members_can_add", sa.Boolean, nullable=False, server_default=sa.true()),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+)
+
+member = sa.Table(
+    "member",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("email", sa.Text, nullable=False),
+    sa.Column("is_admin", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("seated_at", sa.DateTime(timezone=True), nullable=True, server_default=sa.func.now()),
+    sa.Column("timezone", sa.Text, nullable=True),
+    sa.Column("display_name", sa.Text, nullable=True),
+    sa.Column("given_name", sa.Text, nullable=True),
+    sa.Column("display_name_source", sa.Text, nullable=True),
+    sa.Column("photo_digest", sa.Text, nullable=True),
+    sa.Column("photo_source", sa.Text, nullable=True),
+    sa.Column("signin_photo_url", sa.Text, nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.UniqueConstraint("workspace_id", "email"),
+    sa.UniqueConstraint("workspace_id", "id", name="member_workspace_identity"),
+    sa.CheckConstraint(
+        "display_name_source is null or display_name_source in "
+        "('member', 'signin', 'slack', 'gravatar')",
+        name="member_display_name_source",
+    ),
+    sa.CheckConstraint(
+        "photo_source is null or photo_source in ('member', 'signin', 'slack', 'gravatar')",
+        name="member_photo_source",
+    ),
+)
+
+sa.Index("member_email", member.c.email)
+
+surface_identity = sa.Table(
+    "surface_identity",
+    metadata,
+    sa.Column(
+        "workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), primary_key=True, nullable=False
+    ),
+    sa.Column("member_id", sa.Uuid, sa.ForeignKey("member.id"), nullable=False),
+    sa.Column("surface", sa.Text, primary_key=True),
+    sa.Column("external_id", sa.Text, primary_key=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+)
+
+surface_installation = sa.Table(
+    "surface_installation",
+    metadata,
+    sa.Column(
+        "workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), primary_key=True, nullable=False
+    ),
+    sa.Column("surface", sa.Text, primary_key=True),
+    sa.Column("installation_id", sa.Text, nullable=False),
+    sa.Column("agent_id", sa.Uuid, sa.ForeignKey("agent.id"), nullable=False),
+    sa.Column("routes_ingress", sa.Boolean, nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Index(
+        "surface_installation_surface_installation_id_key",
+        "surface",
+        "installation_id",
+        unique=True,
+        postgresql_where=sa.text("routes_ingress"),
+        sqlite_where=sa.text("routes_ingress"),
+    ),
+    sa.CheckConstraint("installation_id <> ''", name="surface_installation_id_nonempty"),
+)
+
+surface_address = sa.Table(
+    "surface_address",
+    metadata,
+    sa.Column("surface", sa.Text, primary_key=True),
+    sa.Column("address", sa.Text, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False, index=True),
+    sa.Column("member_id", sa.Uuid, sa.ForeignKey("member.id"), nullable=False),
+    sa.Column("claim_expires_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("proved_by", sa.Text, nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.CheckConstraint("address <> ''", name="surface_address_address_nonempty"),
+    sa.CheckConstraint(
+        "claim_expires_at is null or proved_by is null",
+        name="surface_address_claim_or_proof",
+    ),
+)
+
+surface_stream_cursor = sa.Table(
+    "surface_stream_cursor",
+    metadata,
+    sa.Column("surface", sa.Text, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=True),
+    sa.Column("installation_id", sa.Text, nullable=False),
+    sa.Column("sequence", sa.BigInteger, nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.CheckConstraint("installation_id <> ''", name="surface_stream_cursor_id_nonempty"),
+)
+
+agent = sa.Table(
+    "agent",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("name", sa.Text, nullable=False),
+    sa.Column("icon", sa.Text, nullable=False, server_default=sa.text(f"'{DEFAULT_AGENT_ICON}'")),
+    sa.Column("prompt", sa.Text, nullable=False),
+    sa.Column("purpose", sa.Text, nullable=True),
+    sa.Column("model", sa.Text, nullable=False),
+    sa.Column("reasoning", sa.Text, nullable=False, server_default=sa.text("'auto'")),
+    sa.Column("is_main", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("visibility", sa.Text, nullable=False, server_default=sa.text("'private'")),
+    sa.Column("internet_access_allowed", sa.Boolean, nullable=False, server_default=sa.true()),
+    sa.Column("use_workspace_skills", sa.Boolean, nullable=False, server_default=sa.true()),
+    sa.Column("sandbox_size", sa.Text, nullable=False, server_default=sa.text("'small'")),
+    sa.Column("tools", sa.JSON, nullable=True),
+    sa.Column("input_schema", sa.JSON(none_as_null=True), nullable=True),
+    sa.Column("output_schema", sa.JSON(none_as_null=True), nullable=True),
+    sa.Column("owner_member_id", sa.Uuid, nullable=True),
+    sa.Column("provisioned_by", sa.Text, nullable=True),
+    sa.Column("provisioned_name", sa.Text, nullable=True),
+    sa.Column("provisioned_version", sa.Text, nullable=True),
+    sa.Column("setup", sa.JSON, nullable=True),
+    sa.Column("archived_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("archived_name", sa.Text, nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.CheckConstraint(
+        "reasoning in ('auto', 'off', 'low', 'medium', 'high')", name="agent_reasoning"
+    ),
+    sa.CheckConstraint("archived_at is null or not is_main", name="agent_archive_scope"),
+    sa.CheckConstraint(
+        "(archived_at is null and archived_name is null) "
+        "or (archived_at is not null and archived_name is not null)",
+        name="agent_archived_name_state",
+    ),
+    sa.CheckConstraint("sandbox_size in ('small', 'medium', 'large')", name="agent_sandbox_size"),
+    sa.CheckConstraint("visibility in ('private', 'workspace')", name="agent_visibility"),
+    sa.CheckConstraint(
+        "(provisioned_by is null) = (provisioned_name is null) "
+        "and (provisioned_by is null) = (provisioned_version is null)",
+        name="agent_provenance",
+    ),
+    sa.UniqueConstraint(
+        "workspace_id", "provisioned_by", "provisioned_name", name="agent_provision_identity"
+    ),
+    sa.UniqueConstraint("workspace_id", "name"),
+    sa.UniqueConstraint("workspace_id", "id", name="agent_workspace_identity"),
+    sa.Index(
+        "agent_workspace_main",
+        "workspace_id",
+        unique=True,
+        postgresql_where=sa.text("is_main"),
+        sqlite_where=sa.text("is_main"),
+    ),
+)
+
+conversation = sa.Table(
+    "conversation",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("agent_id", sa.Uuid, sa.ForeignKey("agent.id"), nullable=False),
+    sa.Column("surface", sa.Text, nullable=False),
+    sa.Column("queue_key", sa.Text, nullable=False),
+    sa.Column("surface_label", sa.Text, nullable=True),
+    sa.Column("title", sa.Text, nullable=True),
+    sa.Column("title_summarized", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("member_id", sa.Uuid, sa.ForeignKey("member.id"), nullable=True),
+    sa.Column(
+        "audience",
+        sa.Text,
+        nullable=False,
+        default=_conversation_audience,
+        server_default="shared",
+    ),
+    sa.Column("sandbox_conversation_id", sa.Uuid, nullable=True),
+    sa.Column("sandbox_handle", sa.Text, nullable=True),
+    sa.Column("archived_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.UniqueConstraint(
+        "workspace_id",
+        "surface",
+        "queue_key",
+        name="conversation_workspace_surface_queue_key_key",
+    ),
+    sa.UniqueConstraint("workspace_id", "id", name="conversation_workspace_identity"),
+    sa.Index("conversation_workspace", "workspace_id"),
+    sa.CheckConstraint(
+        "audience = 'shared' or audience like 'member:%' or "
+        "audience like 'room:%:%' or audience like 'foreign:%:%'",
+        name="conversation_audience",
+    ),
+    sa.CheckConstraint(
+        "(member_id is null and audience not like 'member:%') or "
+        "(member_id is not null and audience like 'member:%')",
+        name="conversation_audience_member",
+    ),
+    sa.Index(
+        "conversation_sandbox",
+        "workspace_id",
+        postgresql_where=sa.text("sandbox_handle is not null"),
+        sqlite_where=sa.text("sandbox_handle is not null"),
+    ),
+    sa.Index(
+        "conversation_awaiting_title",
+        "workspace_id",
+        postgresql_where=sa.text("not title_summarized"),
+        sqlite_where=sa.text("not title_summarized"),
+    ),
+)
+
+member_authorization = sa.Table(
+    "member_authorization",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, nullable=False),
+    sa.Column("member_id", sa.Uuid, nullable=False),
+    sa.Column("agent_id", sa.Uuid, nullable=False),
+    sa.Column("conversation_id", sa.Uuid, nullable=False),
+    sa.Column("call", sa.Text, nullable=False),
+    sa.Column("effect_digest", sa.Text, nullable=False),
+    sa.Column("effect", sa.JSON, nullable=False),
+    sa.Column("scope_digest", sa.Text, nullable=True),
+    sa.Column("scope", sa.JSON(none_as_null=True), nullable=True),
+    sa.Column("binding_digest", sa.Text, nullable=True),
+    sa.Column("request_summary", sa.Text, nullable=True),
+    sa.Column("scope_summary", sa.Text, nullable=True),
+    sa.Column("request_key", sa.Text, nullable=False),
+    sa.Column("decision_key", sa.Text, nullable=True),
+    sa.Column("requested_by", sa.Uuid, nullable=False),
+    sa.Column("decided_by", sa.Uuid, nullable=True),
+    sa.Column("decision", sa.Text, nullable=True),
+    sa.Column("basis", sa.Text, nullable=True),
+    sa.Column("evidence", sa.Text, nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "member_id"],
+        ["member.workspace_id", "member.id"],
+        ondelete="CASCADE",
+        name="member_authorization_member_fkey",
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "agent_id"],
+        ["agent.workspace_id", "agent.id"],
+        ondelete="CASCADE",
+        name="member_authorization_agent_fkey",
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "conversation_id"],
+        ["conversation.workspace_id", "conversation.id"],
+        ondelete="CASCADE",
+        name="member_authorization_conversation_fkey",
+    ),
+    sa.UniqueConstraint(
+        "workspace_id",
+        "request_key",
+        name="member_authorization_request_key",
+    ),
+    sa.UniqueConstraint(
+        "workspace_id",
+        "decision_key",
+        name="member_authorization_decision_key",
+    ),
+    sa.CheckConstraint("call <> ''", name="member_authorization_call_nonempty"),
+    sa.CheckConstraint("request_key <> ''", name="member_authorization_request_key_nonempty"),
+    sa.CheckConstraint("effect_digest <> ''", name="member_authorization_digest_nonempty"),
+    sa.CheckConstraint(
+        "(scope_digest is null) = (scope is null)",
+        name="member_authorization_scope_pair",
+    ),
+    sa.CheckConstraint(
+        "(binding_digest is null) = (scope_digest is null)",
+        name="member_authorization_binding_scope_pair",
+    ),
+    sa.CheckConstraint(
+        "decision is null or decision in ('allow', 'always', 'deny', 'revoke', 'superseded')",
+        name="member_authorization_decision",
+    ),
+    sa.CheckConstraint(
+        "(decision is null) = (decided_by is null) and "
+        "(decision is null) = (decision_key is null) and "
+        "(decision is null) = (basis is null) and "
+        "(decision is null) = (evidence is null)",
+        name="member_authorization_decided",
+    ),
+    sa.CheckConstraint(
+        "basis is null or basis in ('selected_message', 'pending_answer', 'standing')",
+        name="member_authorization_basis",
+    ),
+    sa.Index(
+        "member_authorization_pending",
+        "workspace_id",
+        "conversation_id",
+        "member_id",
+        unique=True,
+        postgresql_where=sa.text("decision is null"),
+        sqlite_where=sa.text("decision is null"),
+    ),
+)
+
+member_permission = sa.Table(
+    "member_permission",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, nullable=False),
+    sa.Column("member_id", sa.Uuid, nullable=False),
+    sa.Column("agent_id", sa.Uuid, nullable=False),
+    sa.Column("call", sa.Text, nullable=False),
+    sa.Column("effect_digest", sa.Text, nullable=False),
+    sa.Column("effect", sa.JSON, nullable=False),
+    sa.Column("scope_digest", sa.Text, nullable=True),
+    sa.Column("scope", sa.JSON(none_as_null=True), nullable=True),
+    sa.Column("granted_by", sa.Uuid, nullable=False),
+    sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "member_id"],
+        ["member.workspace_id", "member.id"],
+        ondelete="CASCADE",
+        name="member_permission_member_fkey",
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "agent_id"],
+        ["agent.workspace_id", "agent.id"],
+        ondelete="CASCADE",
+        name="member_permission_agent_fkey",
+    ),
+    sa.UniqueConstraint(
+        "workspace_id",
+        "member_id",
+        "agent_id",
+        "call",
+        "effect_digest",
+        name="member_permission_identity",
+    ),
+    sa.CheckConstraint("call <> ''", name="member_permission_call_nonempty"),
+    sa.CheckConstraint("effect_digest <> ''", name="member_permission_digest_nonempty"),
+    sa.CheckConstraint(
+        "(scope_digest is null) = (scope is null)",
+        name="member_permission_scope_pair",
+    ),
+    sa.Index("member_permission_member", "workspace_id", "member_id"),
+    sa.Index(
+        "member_permission_scope_identity",
+        "workspace_id",
+        "member_id",
+        "agent_id",
+        "call",
+        "scope_digest",
+        unique=True,
+    ),
+)
+
+turn = sa.Table(
+    "turn",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("conversation_id", sa.Uuid, sa.ForeignKey("conversation.id"), nullable=False),
+    sa.Column("agent_id", sa.Uuid, sa.ForeignKey("agent.id"), nullable=False),
+    sa.Column("seq", sa.Integer, nullable=False),
+    sa.Column("status", sa.Text, nullable=False),
+    sa.Column("inbound", sa.Text, nullable=False),
+    sa.Column("admission_source", sa.Text, nullable=False, server_default="internal"),
+    sa.Column("speaker_member_id", sa.Uuid, sa.ForeignKey("member.id"), nullable=True),
+    sa.Column("member_id", sa.Uuid, sa.ForeignKey("member.id"), nullable=True),
+    sa.Column("fired_by_kind", sa.Text, nullable=True),
+    sa.Column("fired_by_name", sa.Text, nullable=True),
+    sa.Column("fired_by_title", sa.Text, nullable=True),
+    sa.Column("fired_by_provider", sa.Text, nullable=True),
+    sa.Column("connect_authorization_url", sa.Text, nullable=True),
+    sa.Column("connect_authorized_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("connect_landed_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("context", sa.JSON(none_as_null=True), nullable=True),
+    sa.Column("terminal", sa.JSON(none_as_null=True), nullable=True),
+    sa.Column("created_refs", sa.JSON(none_as_null=True), nullable=True),
+    sa.Column("parent_turn_id", sa.Uuid, nullable=True),
+    sa.Column("subagent_profile", sa.Text, nullable=True),
+    sa.Column("subagent_name", sa.Text, nullable=True),
+    sa.Column("byok", sa.Boolean, nullable=True),
+    sa.Column("byok_attempt", sa.Text, nullable=True),
+    sa.Column("billing_identity", sa.JSON(none_as_null=True), nullable=True),
+    sa.Column("result_delivery", sa.Text, nullable=True),
+    sa.Column("spawn_delivers_result", sa.Boolean, nullable=True),
+    sa.Column("spawn_request_fingerprint", sa.Text, nullable=True),
+    sa.Column("traceparent", sa.Text, nullable=True),
+    sa.Column("runtime_config", sa.JSON(none_as_null=True), nullable=True),
+    sa.Column(
+        "model_accounts",
+        sa.JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+        server_default=sa.text("'[]'"),
+    ),
+    sa.Column("idempotency_key", sa.Text, nullable=True),
+    sa.Column("running_attempt", sa.Text, nullable=True),
+    sa.Column("dispatch_enqueued_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("retry_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("external_retry_count", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("detached_until", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.UniqueConstraint("conversation_id", "seq"),
+    sa.CheckConstraint("seq >= 1", name="turn_seq"),
+    sa.CheckConstraint(
+        "status in ('queued', 'running', 'parked', 'done', 'failed', 'cancelled')",
+        name="turn_status",
+    ),
+    sa.CheckConstraint(
+        "admission_source in ('member', 'internal', 'scheduled', 'intent')",
+        name="turn_admission_source",
+    ),
+    sa.CheckConstraint(
+        "(status in ('queued', 'running', 'parked')) = (terminal is null)", name="turn_terminal"
+    ),
+    sa.CheckConstraint(
+        "(connect_authorization_url is null) = (connect_authorized_at is null)",
+        name="turn_connect_authorization",
+    ),
+    sa.CheckConstraint("result_delivery in ('pending', 'delivered')", name="turn_result_delivery"),
+    sa.CheckConstraint("external_retry_count >= 0", name="turn_external_retry_count"),
+    sa.Index("turn_idempotency_key", "workspace_id", "idempotency_key", unique=True),
+    sa.Index(
+        "turn_detached",
+        "workspace_id",
+        postgresql_where=sa.text("detached_until is not null"),
+        sqlite_where=sa.text("detached_until is not null"),
+    ),
+    sa.Index("turn_conversation_activity", "conversation_id", "updated_at"),
+    sa.Index(
+        "turn_fired",
+        "workspace_id",
+        "agent_id",
+        "created_at",
+        postgresql_where=sa.text("fired_by_kind is not null"),
+        sqlite_where=sa.text("fired_by_kind is not null"),
+    ),
+    sa.Index(
+        "turn_fired_by",
+        "workspace_id",
+        "fired_by_kind",
+        "fired_by_name",
+        "created_at",
+        postgresql_where=sa.text("fired_by_kind is not null"),
+        sqlite_where=sa.text("fired_by_kind is not null"),
+    ),
+    sa.Index(
+        "turn_parked",
+        "workspace_id",
+        postgresql_where=sa.text("status = 'parked'"),
+        sqlite_where=sa.text("status = 'parked'"),
+    ),
+    sa.Index(
+        "turn_retry_at",
+        "retry_at",
+        postgresql_where=sa.text("status = 'parked' and retry_at is not null"),
+        sqlite_where=sa.text("status = 'parked' and retry_at is not null"),
+    ),
+    sa.Index(
+        "turn_spoken",
+        "workspace_id",
+        "conversation_id",
+        "speaker_member_id",
+        postgresql_where=sa.text("speaker_member_id is not null"),
+        sqlite_where=sa.text("speaker_member_id is not null"),
+    ),
+    sa.Index(
+        "turn_member_admitted",
+        "workspace_id",
+        "conversation_id",
+        postgresql_where=sa.text("admission_source = 'member'"),
+        sqlite_where=sa.text("admission_source = 'member'"),
+    ),
+    sa.Index(
+        "turn_parent",
+        "parent_turn_id",
+        postgresql_where=sa.text("parent_turn_id is not null"),
+        sqlite_where=sa.text("parent_turn_id is not null"),
+    ),
+    sa.Index(
+        "turn_result_pending",
+        "workspace_id",
+        postgresql_where=sa.text("result_delivery = 'pending'"),
+        sqlite_where=sa.text("result_delivery = 'pending'"),
+    ),
+    sa.Index(
+        "turn_agent_live",
+        "agent_id",
+        "status",
+        postgresql_where=sa.text("terminal is null"),
+        sqlite_where=sa.text("terminal is null"),
+    ),
+    sa.Index("turn_agent_activity", "agent_id", "updated_at", "id"),
+)
+
+detached_task = sa.Table(
+    "detached_task",
+    metadata,
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("turn_id", sa.Uuid, sa.ForeignKey("turn.id", ondelete="CASCADE"), nullable=False),
+    sa.Column("conversation_id", sa.Uuid, sa.ForeignKey("conversation.id"), nullable=False),
+    sa.Column(
+        "sandbox_conversation_id",
+        sa.Uuid,
+        sa.ForeignKey("conversation.id"),
+        nullable=False,
+    ),
+    sa.Column("task", sa.Text, nullable=False),
+    sa.Column("runtime_base", sa.Text, nullable=False),
+    sa.Column("follow_until", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.PrimaryKeyConstraint("turn_id", "task"),
+    sa.CheckConstraint("task <> ''", name="detached_task_task_nonempty"),
+    sa.CheckConstraint("runtime_base <> ''", name="detached_task_runtime_base_nonempty"),
+    sa.Index("detached_task_workspace", "workspace_id"),
+)
+
+inbound_message = sa.Table(
+    "inbound_message",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("conversation_id", sa.Uuid, sa.ForeignKey("conversation.id"), nullable=False),
+    sa.Column("seq", sa.Integer, nullable=False),
+    sa.Column("body", sa.Text, nullable=False),
+    sa.Column("admission_source", sa.Text, nullable=False),
+    sa.Column("context", sa.JSON(none_as_null=True), nullable=True),
+    sa.Column("speaker_member_id", sa.Uuid, sa.ForeignKey("member.id"), nullable=True),
+    sa.Column("member_id", sa.Uuid, sa.ForeignKey("member.id"), nullable=True),
+    sa.Column("idempotency_key", sa.Text, nullable=True),
+    sa.Column("admitted_turn_id", sa.Uuid, sa.ForeignKey("turn.id"), nullable=False),
+    sa.Column("consumed_turn_id", sa.Uuid, sa.ForeignKey("turn.id"), nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.UniqueConstraint("conversation_id", "seq"),
+    sa.CheckConstraint(
+        "admission_source in ('member', 'internal')", name="inbound_message_admission_source"
+    ),
+    sa.Index("inbound_message_idempotency_key", "workspace_id", "idempotency_key", unique=True),
+    sa.Index(
+        "inbound_message_pending",
+        "conversation_id",
+        postgresql_where=sa.text("consumed_turn_id is null"),
+        sqlite_where=sa.text("consumed_turn_id is null"),
+    ),
+)
+
+ledger = sa.Table(
+    "ledger",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, nullable=False),
+    sa.Column("turn_id", sa.Uuid, sa.ForeignKey("turn.id"), nullable=True),
+    sa.Column("dimension", sa.Text, nullable=False),
+    sa.Column("amount", sa.BigInteger, nullable=False),
+    sa.Column("prompt_tokens", sa.BigInteger, nullable=False, server_default=sa.text("0")),
+    sa.Column("input_tokens", sa.BigInteger, nullable=False, server_default=sa.text("0")),
+    sa.Column("output_tokens", sa.BigInteger, nullable=False, server_default=sa.text("0")),
+    sa.Column("cache_read_tokens", sa.BigInteger, nullable=False, server_default=sa.text("0")),
+    sa.Column("cache_write_5m_tokens", sa.BigInteger, nullable=False, server_default=sa.text("0")),
+    sa.Column("cache_write_30m_tokens", sa.BigInteger, nullable=False, server_default=sa.text("0")),
+    sa.Column("cache_write_1h_tokens", sa.BigInteger, nullable=False, server_default=sa.text("0")),
+    sa.Column("byok", sa.Boolean, nullable=True),
+    sa.Column("token_classes_complete", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("priced_micro_usd", sa.BigInteger, nullable=False),
+    sa.Column("debited_micro_usd", sa.BigInteger, nullable=False, server_default=sa.text("0")),
+    sa.Column("model", sa.Text, nullable=False),
+    sa.Column("price_digest", sa.Text, nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.CheckConstraint(
+        "dimension in ('tokens', 'egress', 'sandbox_tokens', 'images', 'videos')",
+        name="ledger_dimension",
+    ),
+    sa.CheckConstraint("amount > 0", name="ledger_amount"),
+    sa.CheckConstraint("priced_micro_usd >= 0", name="ledger_priced"),
+    sa.CheckConstraint(
+        "input_tokens >= 0 and output_tokens >= 0 and cache_read_tokens >= 0 "
+        "and cache_write_5m_tokens >= 0 and cache_write_30m_tokens >= 0 "
+        "and cache_write_1h_tokens >= 0",
+        name="ledger_token_classes_nonnegative",
+    ),
+    sa.CheckConstraint(
+        "dimension not in ('tokens', 'sandbox_tokens') or not token_classes_complete or "
+        "amount = input_tokens + output_tokens "
+        "+ cache_read_tokens + cache_write_5m_tokens + cache_write_30m_tokens "
+        "+ cache_write_1h_tokens",
+        name="ledger_token_classes_total",
+    ),
+    sa.CheckConstraint(
+        "dimension not in ('tokens', 'sandbox_tokens') or not token_classes_complete or "
+        "prompt_tokens = input_tokens "
+        "+ cache_read_tokens + cache_write_5m_tokens + cache_write_30m_tokens "
+        "+ cache_write_1h_tokens",
+        name="ledger_prompt_classes_total",
+    ),
+    sa.CheckConstraint("not byok or dimension = 'tokens'", name="ledger_byok_dimension"),
+    sa.Index("ledger_turn", "turn_id"),
+    sa.Index("ledger_workspace_created", "workspace_id", "created_at"),
+)
+
+ledger_job_day = sa.Table(
+    "ledger_job_day",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, nullable=False),
+    sa.Column("day", sa.Date, nullable=False),
+    sa.Column("dimension", sa.Text, nullable=False),
+    sa.Column("model", sa.Text, nullable=False),
+    sa.Column("price_digest", sa.Text, nullable=True),
+    sa.Column("amount", sa.BigInteger, nullable=False),
+    sa.Column("priced_micro_usd", sa.BigInteger, nullable=False),
+    sa.Column("first_used_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.CheckConstraint("amount > 0", name="ledger_job_day_amount"),
+    sa.CheckConstraint("priced_micro_usd >= 0", name="ledger_job_day_priced"),
+    sa.Index("ledger_job_day_workspace", "workspace_id", "day"),
+)
+
+ledger_export = sa.Table(
+    "ledger_export",
+    metadata,
+    sa.Column("consumer", sa.Text, nullable=False),
+    sa.Column("ledger_id", sa.Uuid, sa.ForeignKey("ledger.id"), nullable=False),
+    sa.Column("from_amount", sa.BigInteger, nullable=False),
+    sa.Column("workspace_id", sa.Uuid, nullable=False),
+    sa.Column("to_amount", sa.BigInteger, nullable=False),
+    sa.Column("from_micro_usd", sa.BigInteger, nullable=False),
+    sa.Column("to_micro_usd", sa.BigInteger, nullable=False),
+    sa.Column("byok", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("occurred_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("acked_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.PrimaryKeyConstraint("consumer", "ledger_id", "from_amount"),
+    sa.CheckConstraint("to_amount > from_amount", name="ledger_export_delta"),
+    sa.Index(
+        "ledger_export_pending",
+        "consumer",
+        "workspace_id",
+        postgresql_where=sa.text("acked_at is null"),
+        sqlite_where=sa.text("acked_at is null"),
+    ),
+)
+
+spend_cap = sa.Table(
+    "spend_cap",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("scope", sa.Text, nullable=False),
+    sa.Column("subject_id", sa.Uuid, nullable=True),
+    sa.Column("window_seconds", sa.Integer, nullable=False),
+    sa.Column("limit_micro_usd", sa.BigInteger, nullable=False),
+    sa.Column("on_breach", sa.Text, nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.CheckConstraint("scope in ('workspace', 'member', 'agent')", name="spend_cap_scope"),
+    sa.CheckConstraint("(scope = 'workspace') = (subject_id is null)", name="spend_cap_subject"),
+    sa.CheckConstraint("window_seconds > 0", name="spend_cap_window"),
+    sa.CheckConstraint("limit_micro_usd > 0", name="spend_cap_limit"),
+    sa.CheckConstraint("on_breach in ('park', 'reject')", name="spend_cap_on_breach"),
+    sa.UniqueConstraint(
+        "workspace_id", "scope", "subject_id", "window_seconds", name="spend_cap_identity"
+    ),
+    sa.Index("spend_cap_workspace", "workspace_id"),
+)
+
+object_change = sa.Table(
+    "object_change",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column(
+        "workspace_id", sa.Uuid, sa.ForeignKey("workspace.id", ondelete="CASCADE"), nullable=False
+    ),
+    sa.Column("kind", sa.Text, nullable=False),
+    sa.Column("name", sa.Text, nullable=False),
+    sa.Column("verb", sa.Text, nullable=False),
+    sa.Column("caller", sa.Text, nullable=False),
+    sa.Column("agent_id", sa.Uuid, nullable=False),
+    sa.Column("spec_before", sa.Text, nullable=True),
+    sa.Column("spec_after", sa.Text, nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.CheckConstraint("verb in ('create', 'update', 'delete')", name="object_change_verb"),
+    sa.Index("object_change_workspace", "workspace_id", "created_at"),
+)
+
+credential = sa.Table(
+    "credential",
+    metadata,
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), primary_key=True),
+    sa.Column("slot", sa.Text, primary_key=True),
+    sa.Column("ciphertext", sa.LargeBinary, nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+)
+
+credential_fulfillment = sa.Table(
+    "credential_fulfillment",
+    metadata,
+    sa.Column(
+        "workspace_id", sa.Uuid, sa.ForeignKey("workspace.id", ondelete="CASCADE"), primary_key=True
+    ),
+    sa.Column("request_id", sa.Uuid, primary_key=True),
+    sa.Column("slot", sa.Text, primary_key=True),
+    sa.Column("member_id", sa.Uuid, nullable=True),
+    sa.Column("fulfilled_at", sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "member_id"],
+        ["member.workspace_id", "member.id"],
+    ),
+)
+
+connection = sa.Table(
+    "connection",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("provider", sa.Text, nullable=False),
+    sa.Column("account_id", sa.Text, nullable=False),
+    sa.Column("identity", sa.Text, nullable=True),
+    sa.Column("host", sa.Text, nullable=False),
+    sa.Column("base_url", sa.Text, nullable=True),
+    sa.Column("backfill_days", sa.Integer, nullable=True),
+    sa.Column("owner_member_id", sa.Uuid, nullable=True),
+    sa.Column("shared", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("account_label", sa.Text, nullable=True),
+    sa.Column("commit_name", sa.Text, nullable=True),
+    sa.Column("commit_email", sa.Text, nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.UniqueConstraint("workspace_id", "provider", "account_id", name="connection_identity"),
+    sa.UniqueConstraint("workspace_id", "id", name="connection_workspace_identity"),
+    sa.Index(
+        "connection_provider_subject",
+        "workspace_id",
+        "provider",
+        "identity",
+        unique=True,
+        postgresql_where=sa.text("identity is not null"),
+        sqlite_where=sa.text("identity is not null"),
+    ),
+    sa.CheckConstraint("owner_member_id is not null or shared", name="connection_shared"),
+    sa.CheckConstraint(
+        f"backfill_days is null or backfill_days between 1 and {MAX_BACKFILL_DAYS}",
+        name="connection_backfill_days",
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "owner_member_id"],
+        ["member.workspace_id", "member.id"],
+    ),
+)
+
+connector_grant = sa.Table(
+    "connector_grant",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("agent_id", sa.Uuid, nullable=False),
+    sa.Column("connection_id", sa.Uuid, nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.UniqueConstraint(
+        "workspace_id", "agent_id", "connection_id", name="connector_grant_identity"
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "connection_id"],
+        ["connection.workspace_id", "connection.id"],
+        ondelete="CASCADE",
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "agent_id"],
+        ["agent.workspace_id", "agent.id"],
+    ),
+)
+
+proposal = sa.Table(
+    "proposal",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("agent_id", sa.Uuid, sa.ForeignKey("agent.id"), nullable=False),
+    sa.Column("extension", sa.Text, nullable=False),
+    sa.Column("from_digest", sa.Text, nullable=False),
+    sa.Column("to_digest", sa.Text, nullable=False),
+    sa.Column("body", sa.JSON, nullable=False),
+    sa.Column("status", sa.Text, nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.CheckConstraint("status in ('pending', 'approved', 'rejected')", name="proposal_status"),
+)
+
+writeback = sa.Table(
+    "writeback",
+    metadata,
+    sa.Column("turn_id", sa.Uuid, sa.ForeignKey("turn.id"), primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("status", sa.Text, nullable=False),
+    sa.Column("reply_ref", sa.Text, nullable=True),
+    sa.Column("claimed_by", sa.Text, nullable=True),
+    sa.Column("claim_expires_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("last_error", sa.Text, nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.CheckConstraint(
+        "status in ('pending', 'claimed', 'delivered', 'failed')", name="writeback_status"
+    ),
+    sa.Index(
+        "writeback_due",
+        "workspace_id",
+        "created_at",
+        postgresql_where=sa.text("status in ('pending', 'claimed')"),
+        sqlite_where=sa.text("status in ('pending', 'claimed')"),
+    ),
+)
+
+mid_turn_reply = sa.Table(
+    "mid_turn_reply",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("turn_id", sa.Uuid, sa.ForeignKey("turn.id"), nullable=False),
+    sa.Column("round_index", sa.Integer, nullable=False),
+    sa.Column("span_index", sa.Integer, nullable=False),
+    sa.Column("message_ref", sa.Uuid, nullable=True),
+    sa.Column("text", sa.Text, nullable=False),
+    sa.Column("status", sa.Text, nullable=False),
+    sa.Column("reply_ref", sa.Text, nullable=True),
+    sa.Column("claimed_by", sa.Text, nullable=True),
+    sa.Column("claim_expires_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("last_error", sa.Text, nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.CheckConstraint(
+        "status in ('pending', 'claimed', 'delivered', 'failed')", name="mid_turn_reply_status"
+    ),
+    sa.Index(
+        "mid_turn_reply_due",
+        "workspace_id",
+        "created_at",
+        postgresql_where=sa.text("status in ('pending', 'claimed')"),
+        sqlite_where=sa.text("status in ('pending', 'claimed')"),
+    ),
+)
+
+shared_artifact = sa.Table(
+    "shared_artifact",
+    metadata,
+    sa.Column("turn_id", sa.Uuid, sa.ForeignKey("turn.id"), primary_key=True),
+    sa.Column("blob_key", sa.Text, primary_key=True),
+    sa.Column("id", sa.Uuid, nullable=False, default=uuid4),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("member_id", sa.Uuid, sa.ForeignKey("member.id"), nullable=True),
+    sa.Column("filename", sa.Text, nullable=False),
+    sa.Column("subject", sa.Text, nullable=True),
+    sa.Column("media_type", sa.Text, nullable=False),
+    sa.Column("size_bytes", sa.BigInteger, nullable=False),
+    sa.Column("is_workspace_export", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("request_fingerprint", sa.Text, nullable=True),
+    sa.Column("digest", sa.Text, nullable=True),
+    sa.Column("is_text", sa.Boolean, nullable=True),
+    sa.Column("preview_blob_key", sa.Text, nullable=True),
+    sa.Column("preview_media_type", sa.Text, nullable=True),
+    sa.Column("preview_size_bytes", sa.BigInteger, nullable=True),
+    sa.Column(
+        "attached_by_member",
+        sa.Boolean,
+        nullable=False,
+        server_default=sa.false(),
+    ),
+    sa.Column("role", sa.Text, nullable=False, server_default="file"),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.UniqueConstraint("id", name="shared_artifact_id"),
+    sa.CheckConstraint("size_bytes >= 0", name="shared_artifact_size"),
+    sa.CheckConstraint("role in ('file', 'details')", name="shared_artifact_role"),
+    sa.CheckConstraint(
+        "(preview_blob_key IS NULL) = (preview_media_type IS NULL) "
+        "AND (preview_blob_key IS NULL) = (preview_size_bytes IS NULL) "
+        "AND (preview_size_bytes IS NULL OR preview_size_bytes >= 0)",
+        name="shared_artifact_preview",
+    ),
+    sa.Index(
+        "shared_artifact_files",
+        "workspace_id",
+        "filename",
+        "created_at",
+        "blob_key",
+        postgresql_where=sa.text("role = 'file'"),
+        sqlite_where=sa.text("role = 'file'"),
+    ),
+)
+
+ext_store = sa.Table(
+    "ext_store",
+    metadata,
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), primary_key=True),
+    sa.Column("extension", sa.Text, primary_key=True),
+    sa.Column("key", sa.Text, primary_key=True),
+    sa.Column("value", sa.JSON, nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Index("ext_store_key", "extension", "key"),
+)
+
+runtime_instance = sa.Table(
+    "runtime_instance",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=True),
+    sa.Column("heartbeat_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Index("runtime_instance_live", "workspace_id", "heartbeat_at"),
+)
+
+surface_listener_claim = sa.Table(
+    "surface_listener_claim",
+    metadata,
+    sa.Column("surface", sa.Text, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=True),
+    sa.Column(
+        "owner_id",
+        sa.Uuid,
+        sa.ForeignKey("runtime_instance.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    sa.Column("owner_token", sa.Uuid, nullable=False),
+    sa.Column("claim_expires_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.CheckConstraint("surface <> ''", name="surface_listener_claim_surface_nonempty"),
+)
+
+source = sa.Table(
+    "source",
+    metadata,
+    sa.Column("uid", sa.Uuid, nullable=False),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("backend", sa.Text, nullable=False),
+    sa.Column("config", sa.JSON, nullable=False),
+    sa.Column("feed_handle", sa.Text, nullable=False),
+    sa.Column("connection_id", sa.Uuid, nullable=False),
+    sa.Column("cursor", sa.Text, nullable=True),
+    sa.Column("partition_cursor", sa.Text, nullable=True),
+    sa.Column("synced_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("next_sync_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("consecutive_errors", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("consecutive_refusals", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("consecutive_empty", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("parked_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("parked_reason", sa.Text, nullable=True),
+    sa.Column("parked_since", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("parked_awaits_grant", sa.Boolean, nullable=False, server_default=sa.false()),
+    sa.Column("claimed_by", sa.Text, nullable=True),
+    sa.Column("claim_expires_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.PrimaryKeyConstraint("workspace_id", "uid", name="source_pkey"),
+    sa.Index("source_due", "next_sync_at"),
+    sa.Index("source_authority", "workspace_id", "connection_id"),
+    sa.Index(
+        "source_feed_handle", "workspace_id", "connection_id", "backend", "feed_handle", unique=True
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "connection_id"],
+        ["connection.workspace_id", "connection.id"],
+        ondelete="CASCADE",
+        name="source_authority_fkey",
+    ),
+)
+
+transcript_access = sa.Table(
+    "transcript_access",
+    metadata,
+    sa.Column("id", sa.Uuid, primary_key=True),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("conversation_id", sa.Uuid, nullable=False),
+    sa.Column("reader_member_id", sa.Uuid, nullable=False),
+    sa.Column("subject_member_id", sa.Uuid, nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "conversation_id"],
+        ["conversation.workspace_id", "conversation.id"],
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "reader_member_id"],
+        ["member.workspace_id", "member.id"],
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "subject_member_id"],
+        ["member.workspace_id", "member.id"],
+    ),
+    sa.Index("transcript_access_conversation", "workspace_id", "conversation_id"),
+)
+
+page = sa.Table(
+    "page",
+    metadata,
+    sa.Column("uid", sa.Uuid, nullable=False),
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("source_uid", sa.Uuid, nullable=False),
+    sa.Column("source_identity", sa.Text, nullable=True),
+    sa.Column("digest", sa.Text, nullable=False),
+    sa.Column("body_ref", sa.Text, nullable=False),
+    sa.Column("stream", sa.Text, nullable=False, server_default=""),
+    sa.Column("title", sa.Text, nullable=False, server_default=""),
+    sa.Column("record_created_at", sa.Text, nullable=True),
+    sa.Column("record_updated_at", sa.Text, nullable=True),
+    sa.Column("parent_fields", sa.JSON, nullable=True),
+    sa.Column("subject", sa.Text, nullable=False),
+    sa.Column("revision", sa.BigInteger, nullable=False, server_default="0"),
+    sa.Column("tombstone", sa.Boolean, nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("indexed", sa.Boolean, nullable=False, server_default=sa.true()),
+    sa.CheckConstraint("subject = 'shared' or subject like 'member:%'", name="page_subject"),
+    sa.PrimaryKeyConstraint("workspace_id", "uid", name="page_pkey"),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "source_uid"],
+        ["source.workspace_id", "source.uid"],
+        ondelete="CASCADE",
+        name="page_source_fkey",
+    ),
+    sa.Index("page_feed", "workspace_id", "revision", "uid"),
+    sa.Index("page_source", "workspace_id", "source_uid"),
+    sa.Index(
+        "page_source_identity",
+        "workspace_id",
+        "source_uid",
+        "source_identity",
+        unique=True,
+        postgresql_where=sa.text("source_identity is not null"),
+        sqlite_where=sa.text("source_identity is not null"),
+    ),
+)
+
+conversation_change_cursor = sa.Table(
+    "conversation_change_cursor",
+    metadata,
+    sa.Column(
+        "workspace_id", sa.Uuid, sa.ForeignKey("workspace.id", ondelete="CASCADE"), primary_key=True
+    ),
+    sa.Column("position", sa.BigInteger, nullable=False),
+)
+
+conversation_change_log = sa.Table(
+    "conversation_change_log",
+    metadata,
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("position", sa.BigInteger, nullable=False),
+    sa.Column("conversation_id", sa.Uuid, nullable=False),
+    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "conversation_id"],
+        ["conversation.workspace_id", "conversation.id"],
+        ondelete="CASCADE",
+    ),
+    sa.PrimaryKeyConstraint("workspace_id", "position"),
+    sa.Index("conversation_change_log_age", "created_at"),
+)
+
+conversation_read = sa.Table(
+    "conversation_read",
+    metadata,
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("conversation_id", sa.Uuid, nullable=False),
+    sa.Column("member_id", sa.Uuid, nullable=False),
+    sa.Column("read_at", sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "conversation_id"],
+        ["conversation.workspace_id", "conversation.id"],
+        ondelete="CASCADE",
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "member_id"],
+        ["member.workspace_id", "member.id"],
+        ondelete="CASCADE",
+    ),
+    sa.PrimaryKeyConstraint("workspace_id", "conversation_id", "member_id"),
+)
+
+conversation_pin = sa.Table(
+    "conversation_pin",
+    metadata,
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("conversation_id", sa.Uuid, nullable=False),
+    sa.Column("member_id", sa.Uuid, nullable=False),
+    sa.Column("pinned_at", sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "conversation_id"],
+        ["conversation.workspace_id", "conversation.id"],
+        ondelete="CASCADE",
+    ),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "member_id"],
+        ["member.workspace_id", "member.id"],
+        ondelete="CASCADE",
+    ),
+    sa.PrimaryKeyConstraint("workspace_id", "conversation_id", "member_id"),
+)
+
+conversation_change = sa.Table(
+    "conversation_change",
+    metadata,
+    sa.Column("workspace_id", sa.Uuid, sa.ForeignKey("workspace.id"), nullable=False),
+    sa.Column("conversation_id", sa.Uuid, nullable=False),
+    sa.Column("scan", sa.JSON(none_as_null=True), nullable=False),
+    sa.ForeignKeyConstraint(
+        ["workspace_id", "conversation_id"],
+        ["conversation.workspace_id", "conversation.id"],
+        ondelete="CASCADE",
+    ),
+    sa.PrimaryKeyConstraint("workspace_id", "conversation_id"),
+)

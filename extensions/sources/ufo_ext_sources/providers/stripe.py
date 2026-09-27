@@ -1,0 +1,477 @@
+"""The Stripe connector — the billing, issuing, connect, and checkout surface synced as recallable
+pages.
+
+Stripe has one list shape across every top-level stream: `{data: [...], has_more: bool}` walked with
+`?limit=100&starting_after=<last_id>`, filtered incrementally with `?created[gte]=<unix>` when the
+stream's cursor is `created`. Stripe filters a list by creation only, and a charge, invoice, or
+subscription keeps changing after it is created, so once per `SWEEP_INTERVAL_SECONDS` the filter
+reaches `CREATED_LOOKBACK_SECONDS` behind the cursor and re-reads that window. The cursor of a
+`created` stream is the instant of that sweep, stored as unix seconds: each run of the hour after it
+filters from it, so a record created since the sweep lands again and a between-sweep run costs that
+hour of records rather than the whole window. The run that finishes the next sweep stores its own
+start instant. One decimal timestamp is also what the release this one replaces reads out of that
+column — it filters `created[gte]` from it and advances it as a watermark — so through a rolling
+deploy a pod of either image reads the row the other wrote, and neither skips a record. A capped run
+stores no position of its own: the adapter's positional envelope resumes it, and Stripe returning
+the newest record first makes the between-sweep filter a prefix of the sweep filter, so the skip
+count lands on the same record either way.
+
+Stripe files a child collection either under a path segment
+(`/v1/customers/{id}/payment_methods`) or behind a query param
+(`/v1/subscription_items?subscription={id}`). A usage summary carries period bounds and no
+timestamp, so `usage_records` is cursorless and projects those bounds as its page timestamps; a line
+item carries no instant at all, so its edge carries the session's or invoice's `created` onto it
+under the name the stream reads as its own. An item on Stripe's current meter system has no legacy
+usage summaries; that one partition drops out and the rest continue.
+The pinned API version rides the `Stripe-Version` header. Records arrive flat, so `flatten` is the
+identity passthrough. A refusal (401/403) raises `StreamSkipped`; a partition request Stripe answers
+`resource_missing` drops that one parent and the walk carries on; any other reason Stripe names
+raises `StreamFault` so the failure record carries it; a stored `created` cursor this image cannot
+read raises `CursorExpired`, which the driver clears rather than refusing forever. The credential is
+resolved through the auth proxy the runner threads; this connector holds no token. The write path is
+intentionally absent — source seam only reads."""
+
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from functools import partial
+from typing import Any
+
+import httpx
+
+from ufo.sdk.authproxy import Credential
+from ufo.sdk.sources import (
+    DEFAULT_BACKFILL_WINDOW_DAYS,
+    CursorExpired,
+    ParentEdge,
+    Partition,
+    PartitionBound,
+    PartitionSkipped,
+    RestConnector,
+    Run,
+    StreamFault,
+    StreamPage,
+    StreamSkipped,
+    StreamSpec,
+    WalkPage,
+    fanned_out,
+)
+from ufo_ext_sources.watermark import integer_checkpoint
+
+PAGE_SIZE = 100
+STRIPE_VERSION = "2024-10-28.acacia"
+_REFUSAL_STATUS = frozenset({401, 403})
+VOLATILE_FIELDS = frozenset({"receipt_url", "hosted_invoice_url", "invoice_pdf"})
+USAGE_PERIOD_KEY = "usage_period"
+CREATED_LOOKBACK_SECONDS = 30 * 24 * 60 * 60
+SWEEP_INTERVAL_SECONDS = 60 * 60
+CLOCK_SKEW_SECONDS = 120
+_MISSING_RESOURCE_STATUS = frozenset({400, 404})
+_MISSING_RESOURCE_CODE = "resource_missing"
+_CURRENT_METER_USAGE_PREFIX = "Cannot list usage record summaries for `"
+_CURRENT_METER_USAGE_SUFFIX = (
+    "` because it is not on the legacy metered billing system. "
+    "Call /v1/billing/meters/:id/event_summaries instead."
+)
+
+_EXTRA_PARAMS: dict[str, dict[str, str]] = {
+    "subscriptions": {"status": "all"},
+}
+
+
+def _stripe_error(error: httpx.HTTPStatusError) -> dict[str, Any]:
+    try:
+        body = error.response.json()
+    except ValueError:
+        return {}
+    detail = body.get("error") if isinstance(body, dict) else None
+    return detail if isinstance(detail, dict) else {}
+
+
+def _refusal_reason(error: httpx.HTTPStatusError) -> str:
+    """Stripe refuses with one `error` object, which `response_fault` cannot read; only `message`
+    and `code` ride, since the body echoes the request."""
+    if not error.response.is_client_error:
+        return ""
+    detail = _stripe_error(error)
+    message = detail.get("message")
+    if not isinstance(message, str) or not message:
+        return ""
+    code = detail.get("code")
+    return f"{message} [{code}]" if isinstance(code, str) and code else message
+
+
+def _stream(
+    name: str,
+    *,
+    source_object: str | None = None,
+    primary_key: str = "id",
+    cursor_field: str | None = "created",
+    created_at_field: str | None = "created",
+    updated_at_field: str | None = None,
+    canonical: bool = False,
+    parent: str | None = None,
+    path: str | None = None,
+    carry: dict[str, str] | None = None,
+    backfill_window_days: int | None = DEFAULT_BACKFILL_WINDOW_DAYS,
+) -> StreamSpec:
+    if (parent is None) != (path is None):
+        raise ValueError(f"stripe: stream {name!r} names a parent without a path, or the reverse")
+    return StreamSpec(
+        name=name,
+        source_object=source_object or name,
+        primary_key=primary_key,
+        cursor_field=cursor_field,
+        created_at_field=created_at_field,
+        updated_at_field=updated_at_field,
+        canonical=canonical,
+        backfill_window_days=backfill_window_days,
+        parents=()
+        if parent is None or path is None
+        else (ParentEdge(stream=parent, path=path, carry=carry or {}),),
+    )
+
+
+STRIPE_STREAMS: list[StreamSpec] = [
+    _stream("customers", canonical=True, backfill_window_days=None),
+    _stream("subscriptions", canonical=True, backfill_window_days=None),
+    _stream("plans", backfill_window_days=None),
+    _stream("invoices", canonical=True),
+    _stream("charges", canonical=True),
+    _stream(
+        "usage_records",
+        source_object="subscription_items",
+        primary_key=USAGE_PERIOD_KEY,
+        cursor_field=None,
+        created_at_field="period.start",
+        updated_at_field="period.end",
+        parent="subscription_items",
+        path="/v1/subscription_items/{id}/usage_record_summaries",
+    ),
+    _stream("accounts", cursor_field=None, backfill_window_days=None),
+    _stream("application_fees"),
+    _stream(
+        "application_fees_refunds",
+        source_object="application_fees",
+        cursor_field=None,
+        parent="application_fees",
+        path="/v1/application_fees/{id}/refunds",
+    ),
+    _stream("authorizations", source_object="issuing/authorizations"),
+    _stream("balance_transactions"),
+    _stream(
+        "bank_accounts",
+        source_object="customers",
+        cursor_field=None,
+        parent="customers",
+        path="/v1/customers/{id}/bank_accounts",
+    ),
+    _stream("cardholders", source_object="issuing/cardholders", backfill_window_days=None),
+    _stream("cards", source_object="issuing/cards"),
+    _stream("checkout_sessions", source_object="checkout/sessions"),
+    _stream(
+        "checkout_sessions_line_items",
+        source_object="checkout/sessions",
+        cursor_field="checkout_session_created",
+        created_at_field="checkout_session_created",
+        parent="checkout_sessions",
+        path="/v1/checkout/sessions/{id}/line_items",
+        carry={
+            "checkout_session_created": "created",
+            "checkout_session_expires_at": "expires_at",
+        },
+    ),
+    _stream("coupons", backfill_window_days=None),
+    _stream("credit_notes", canonical=True),
+    _stream(
+        "customer_balance_transactions",
+        source_object="customers",
+        parent="customers",
+        path="/v1/customers/{id}/balance_transactions",
+    ),
+    _stream("disputes", canonical=True),
+    _stream("early_fraud_warnings", source_object="radar/early_fraud_warnings"),
+    _stream("events"),
+    _stream(
+        "external_account_bank_accounts",
+        source_object="accounts",
+        cursor_field=None,
+        parent="accounts",
+        path="/v1/accounts/{id}/external_accounts?object=bank_account",
+    ),
+    _stream(
+        "external_account_cards",
+        source_object="accounts",
+        cursor_field=None,
+        parent="accounts",
+        path="/v1/accounts/{id}/external_accounts?object=card",
+    ),
+    _stream("file_links"),
+    _stream("files"),
+    _stream("invoice_items", source_object="invoiceitems"),
+    _stream(
+        "invoice_line_items",
+        source_object="invoices",
+        cursor_field="invoice_created",
+        created_at_field="invoice_created",
+        parent="invoices",
+        path="/v1/invoices/{id}/lines",
+        carry={"invoice_created": "created"},
+    ),
+    _stream("payment_intents"),
+    _stream(
+        "payment_methods",
+        source_object="customers",
+        cursor_field=None,
+        parent="customers",
+        path="/v1/customers/{id}/payment_methods",
+    ),
+    _stream(
+        "payout_balance_transactions",
+        source_object="balance_transactions",
+        parent="payouts",
+        path="/v1/balance_transactions?payout={id}",
+    ),
+    _stream("payouts", canonical=True),
+    _stream(
+        "persons",
+        source_object="accounts",
+        cursor_field=None,
+        parent="accounts",
+        path="/v1/accounts/{id}/persons",
+    ),
+    _stream("prices", backfill_window_days=None),
+    _stream("products", backfill_window_days=None),
+    _stream("promotion_codes"),
+    _stream("refunds", canonical=True),
+    _stream("reviews"),
+    _stream(
+        "setup_attempts",
+        source_object="setup_attempts",
+        parent="setup_intents",
+        path="/v1/setup_attempts?setup_intent={id}",
+    ),
+    _stream("setup_intents"),
+    _stream("shipping_rates", backfill_window_days=None),
+    _stream(
+        "subscription_items",
+        source_object="subscription_items",
+        cursor_field=None,
+        parent="subscriptions",
+        path="/v1/subscription_items?subscription={id}",
+    ),
+    _stream("subscription_schedule", source_object="subscription_schedules"),
+    _stream("top_ups", source_object="topups"),
+    _stream("transactions", source_object="issuing/transactions"),
+    _stream(
+        "transfer_reversals",
+        source_object="transfers",
+        parent="transfers",
+        path="/v1/transfers/{id}/reversals",
+    ),
+    _stream("transfers"),
+]
+
+
+class StripeConnector(RestConnector):
+    name = "stripe"
+    base_url = "https://api.stripe.com"
+    streams_list = STRIPE_STREAMS
+
+    def checkpoint(
+        self, stream: StreamSpec, records: list[dict[str, Any]], cursor: str | None
+    ) -> str | None:
+        """Advance record watermarks. A created walk emits its sweep checkpoint at completion."""
+        if stream.cursor_field is None or stream.cursor_field == "created":
+            return cursor
+        timestamp = self._cursor_to_unix(cursor)
+        if cursor is not None and timestamp is None:
+            raise ValueError("stripe: invalid timestamp cursor")
+        normalized = str(timestamp) if timestamp is not None else None
+        result = integer_checkpoint(stream, records, normalized)
+        return cursor if result == normalized else result
+
+    def _make_client(self, base_url: str, credential: Credential) -> httpx.AsyncClient:
+        client = super()._make_client(base_url, credential)
+        client.headers["Stripe-Version"] = STRIPE_VERSION
+        return client
+
+    @staticmethod
+    def _list_path(stream: StreamSpec) -> str:
+        return f"/v1/{stream.source_object}"
+
+    @staticmethod
+    def _cursor_to_unix(cursor: str | None) -> int | None:
+        if not cursor:
+            return None
+        text = str(cursor).strip()
+        if text.isdigit():
+            return int(text)
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return int(parsed.timestamp())
+
+    async def paginate(
+        self, client: httpx.AsyncClient, stream: StreamSpec, run: Run
+    ) -> AsyncIterator[list[dict[str, Any]] | StreamPage]:
+        try:
+            if stream.parents:
+                pages = partial(self._partition_pages, client, stream)
+                async for walked in fanned_out(stream, run, pages):
+                    yield walked
+                return
+            if stream.cursor_field == "created":
+                async for checkpointed in self._created_walk(
+                    client, stream, cursor=run.cursor, backfill_after=run.backfill_after
+                ):
+                    yield checkpointed
+                return
+            async for page in self._page_loop(
+                client, self._list_path(stream), stream, cursor=run.cursor
+            ):
+                yield page
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code in _REFUSAL_STATUS:
+                raise StreamSkipped(
+                    f"stripe: {stream.name!r} refused ({error.response.status_code}); the grant "
+                    "lacks scope or the key is invalid"
+                ) from error
+            reason = _refusal_reason(error)
+            if not reason:
+                raise
+            raise StreamFault(
+                f"stripe: {error.response.status_code} {error.request.method} "
+                f"{error.request.url.copy_with(query=None)}: {reason}"
+            ) from error
+
+    async def _created_walk(
+        self,
+        client: httpx.AsyncClient,
+        stream: StreamSpec,
+        *,
+        cursor: str | None,
+        backfill_after: datetime | None = None,
+    ) -> AsyncIterator[list[dict[str, Any]] | StreamPage]:
+        stored = self._cursor_to_unix(cursor)
+        if cursor is not None and stored is None:
+            raise CursorExpired(f"stripe: {stream.name!r} cursor {cursor!r} is not a timestamp")
+        floor = None if backfill_after is None else max(int(backfill_after.timestamp()), 0)
+        now = int(datetime.now(UTC).timestamp())
+        if stored is None or now - stored >= SWEEP_INTERVAL_SECONDS:
+            gte = floor if stored is None else max(stored - CREATED_LOOKBACK_SECONDS, 0)
+            swept = max(now - CLOCK_SKEW_SECONDS, 0)
+        else:
+            gte, swept = stored, stored
+        path = self._list_path(stream)
+        after: str | None = None
+        while True:
+            params: dict[str, Any] = {"limit": PAGE_SIZE, **_EXTRA_PARAMS.get(stream.name, {})}
+            if after is not None:
+                params["starting_after"] = after
+            if gte is not None:
+                params["created[gte]"] = gte
+            data = await self._get(client, path, params=params)
+            rows = data.get("data") or []
+            if rows:
+                yield [self._browse_record(record, stream) for record in rows]
+            last_id = rows[-1].get("id") if rows else None
+            if not data.get("has_more") or not isinstance(last_id, str) or not last_id:
+                break
+            after = last_id
+        yield StreamPage(next_cursor=str(swept))
+
+    async def _page_loop(
+        self,
+        client: httpx.AsyncClient,
+        path: str,
+        stream: StreamSpec,
+        *,
+        cursor: str | None,
+        extra_params: dict[str, str] | None = None,
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        starting_after: str | None = None
+        cursor_unix = self._cursor_to_unix(cursor)
+        while True:
+            params: dict[str, Any] = {"limit": PAGE_SIZE}
+            if starting_after is not None:
+                params["starting_after"] = starting_after
+            if cursor_unix is not None and stream.cursor_field == "created":
+                params["created[gte]"] = cursor_unix
+            stream_extras = _EXTRA_PARAMS.get(stream.name)
+            if stream_extras:
+                params.update(stream_extras)
+            if extra_params:
+                params.update(extra_params)
+            data = await self._get(client, path, params=params)
+            rows = data.get("data") or []
+            records = [self._browse_record(record, stream) for record in rows]
+            if records:
+                yield records
+            if not data.get("has_more"):
+                return
+            last = rows[-1] if rows else None
+            if not isinstance(last, dict) or not last.get("id"):
+                return
+            starting_after = str(last["id"])
+
+    @staticmethod
+    def _browse_record(record: dict[str, Any], stream: StreamSpec) -> dict[str, Any]:
+        normalized = {key: value for key, value in record.items() if key not in VOLATILE_FIELDS}
+        if stream.name == "usage_records":
+            period = normalized.get("period")
+            item = normalized.get("subscription_item")
+            if isinstance(period, dict) and item:
+                normalized[USAGE_PERIOD_KEY] = f"{item}:{period.get('start')}:{period.get('end')}"
+            normalized.pop("id", None)
+        for field in ("created_at", "updated_at"):
+            value = normalized.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                normalized[field] = datetime.fromtimestamp(value, UTC).isoformat()
+        created_value = normalized.get("created")
+        if (
+            normalized.get("created_at") is None
+            and isinstance(created_value, (int, float))
+            and not isinstance(created_value, bool)
+        ):
+            normalized["created_at"] = datetime.fromtimestamp(created_value, UTC).isoformat()
+        cursor_value = normalized.get(stream.cursor_field) if stream.cursor_field else None
+        if (
+            normalized.get("updated_at") is None
+            and isinstance(cursor_value, (int, float))
+            and not isinstance(cursor_value, bool)
+        ):
+            normalized["updated_at"] = datetime.fromtimestamp(cursor_value, UTC).isoformat()
+        return normalized
+
+    async def _partition_pages(
+        self,
+        client: httpx.AsyncClient,
+        stream: StreamSpec,
+        partition: Partition,
+        bound: PartitionBound,
+    ) -> AsyncIterator[WalkPage]:
+        """Stripe spells a gone parent `resource_missing`, as 404 on a path id and 400 on a
+        parameter id, so the code decides, never the status."""
+        try:
+            async for page in self._page_loop(client, partition.path, stream, cursor=None):
+                yield WalkPage(records=page)
+        except httpx.HTTPStatusError as error:
+            detail = _stripe_error(error)
+            missing = (
+                error.response.status_code in _MISSING_RESOURCE_STATUS
+                and detail.get("code") == _MISSING_RESOURCE_CODE
+            )
+            message = detail.get("message")
+            current_meter = (
+                stream.name == "usage_records"
+                and error.response.status_code == 400
+                and isinstance(message, str)
+                and message.startswith(_CURRENT_METER_USAGE_PREFIX)
+                and message.endswith(_CURRENT_METER_USAGE_SUFFIX)
+            )
+            if not missing and not current_meter:
+                raise
+            raise PartitionSkipped(f"stripe: {partition.path} refused") from error

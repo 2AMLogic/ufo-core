@@ -1,0 +1,1728 @@
+"""Content sources: a backend fetches documents into pages, a core job syncs them on an interval.
+
+`SourceBackend` is the seam — `fetch(config, cursor, auth) -> SyncResult` returns the documents a
+source currently holds plus a resume cursor. That cursor lives in one of two row columns: `cursor`
+for a stream that walks its collection itself, `partition_cursor` for one whose backend says it fans
+out over parents (`PartitionedBackend`) — so the image being replaced, which reads every `cursor` as
+its own watermark, never meets a partition map there and the map never meets a watermark. `config`
+is the backend's own typed model (each backend
+owns `config_model`, so a source carries typed parameters, never an untyped bag); `auth` is the
+workspace the sync runs for, so a connector backend can resolve its provider token itself — core
+never mints or holds one. Core ships `FolderSource` (a local directory); connector/S3/GitHub
+backends are extensions registered through the `sources` Manifest point and sourced into
+`SyncDriver.backends` at boot. `SyncDriver` is the core sync job: it claims due sources
+dialect-native — Postgres `FOR UPDATE SKIP LOCKED`, SQLite the single writer — runs connections
+concurrently while keeping each connection's sources serial, fetches, writes each page's body to
+the blob store, and upserts page rows — skipping ones unchanged by
+digest, tombstoning the ones a full-snapshot fetch no longer holds or a delta fetch explicitly
+deletes. It writes NO chunks: the database assigns each material change a workspace-monotonic
+revision, and `PageFeed` — the seam threaded onto an extension's context — replays those changes
+to a downstream indexer under a `(revision, id)` cursor. The core `page` row carries source
+substrate and browse metadata;
+derivation state lives in the indexer's own mirror. The driver polls; it never fires on the writes
+it makes. `source_sync.failed` and `source_sync_failed_total` name a failed provider stream;
+`source_sync.ok` records what a successful run wrote and how many records it dropped;
+the `ufo.source_sync` service check carries each source row's current state, CRITICAL from the run
+that failed until the run that succeeds. A run this deploy's own database ended is none of those:
+`source_sync.deferred` records it, the error counter stands, and the row returns at the normal
+interval, because the database pages its own monitor and the provider was never asked anything.
+A provider that keeps refusing a stream is a case of its own: after
+`SOURCE_REFUSAL_PARK_THRESHOLD` refusals the row parks — held at
+`SOURCE_PARK_RETRY_SECONDS` instead of the interval, and recorded by `source_sync.parked` and
+`source_sync_parked_total` — until a run of it succeeds. A park pages nobody: only a member widening
+a grant ends the refusal, so it is a warning to read, never an alert to answer."""
+
+import asyncio
+import hashlib
+import json
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import suppress
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from functools import partial
+from pathlib import Path
+from typing import Any, ClassVar, Protocol, TypeVar, runtime_checkable
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
+
+import asyncpg
+import httpx
+import sqlalchemy as sa
+import sqlalchemy.exc as sa_exc
+from dbos import DBOS
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+from ufo.blob import WorkspaceBlobStore
+from ufo.config import SourceConfig, SourceEntry
+from ufo.db import owner_tx, workspace_tx
+from ufo.harness.o11y import (
+    SERVICE_CHECK_CRITICAL,
+    SERVICE_CHECK_OK,
+    emit_metric,
+    emit_service_check,
+    formatted_stack,
+    log,
+    log_error,
+    warn,
+)
+from ufo.runtime.access.connectors import AuthProxy, SourceCredentialResolver
+from ufo.runtime.billing.spend import NO_SPEND_GATES, SpendGates
+from ufo.runtime.sources.connector import (
+    FieldValue,
+    ParentPages,
+    ParentRecord,
+    UnprojectedParent,
+    UnreadyParent,
+)
+from ufo.runtime.sources.rest import list_or_empty
+from ufo.runtime.turns.subjects import connection_subject
+from ufo.runtime.workspace import ws_current
+from ufo.schema import tables
+from ufo.schema.ids import uuid7
+
+FOLDER_BACKEND = "folder"
+SOURCE_SYNC_JOB = "source_sync"
+SOURCE_SYNC_SCHEDULE = "0 * * * * *"
+SOURCE_SYNC_INTERVAL_SECONDS = 60
+SOURCE_ERROR_BACKOFF_CAP_SECONDS = 3600
+SOURCE_REFUSAL_PARK_THRESHOLD = 3
+SOURCE_EMPTY_IDLE_THRESHOLD = 5
+SOURCE_EMPTY_IDLE_SECONDS = 24 * 3600
+"""How a connection carries a stream its account does not use. `canonical` is a connector constant
+— the same for every account that ever connects the provider — so a stream that is content for the
+accounts using it and empty for the rest cannot be flagged per account, and the flag alone would
+make every one of those a request a minute forever. A run that lands nothing counts, and a row that
+has never landed a page at all falls back to a daily look after `SOURCE_EMPTY_IDLE_THRESHOLD` of
+them. The first page it ever lands clears the counter and it never idles again, so a populated
+stream that happens to be quiet keeps the interval — being quiet is not being unused."""
+SOURCE_PARK_RETRY_SECONDS = 3600
+SOURCE_PARK_HOLD_SECONDS = 6 * 3600
+"""How long a park that waits on a grant holds the row. A grant event wakes it sooner, so this is
+only the floor under a broker that answered wrongly: an account it calls unusable for three minutes
+and serves again after is a park nothing else would ever lift, because only a grant clears the mark
+the park wrote. Reading the account again is the one thing that tells the two apart."""
+CLAIM_LEASE_SECONDS = 300
+CLAIM_REFRESH_SECONDS = 60
+DUE_BATCH_MAX_SOURCES = 50
+SOURCE_CONNECTION_CONCURRENCY = 4
+SOURCE_BLOB_PREFIX = "sources"
+SOURCE_SYNC_FAILED_METRIC = "source_sync_failed_total"
+SOURCE_SYNC_PARKED_METRIC = "source_sync_parked_total"
+SOURCE_SYNC_CHECK = "source_sync"
+SYNC_PROVIDER_FAULT_MAX_CHARS = 500
+_ASYNCPG_CONNECTION_ERRORS = (
+    asyncpg.PostgresConnectionError,
+    asyncpg.CannotConnectNowError,
+    asyncpg.InterfaceError,
+)
+
+
+class SourceRowConfig(BaseModel):
+    """A backend's typed source config holding parameters of the dataset a row syncs alongside the
+    fields that say WHICH dataset it is. A backend with no such parameters needs neither this base
+    nor its declarations; the default is that every field identifies the row.
+
+    `non_identity_fields` are left out of the row's `feed_handle`, so changing one settles on the
+    row already syncing that dataset. `resolved_fields` is the subset each caller resolves for
+    itself against its own `now`, so `register_source` holds a live row only to the difference: what
+    was asked for must match, what it resolved to is the winner's to set. Each is declared by the
+    model
+    that owns the fields, never by a name core matches across every backend."""
+
+    non_identity_fields: ClassVar[frozenset[str]] = frozenset()
+    resolved_fields: ClassVar[frozenset[str]] = frozenset()
+
+    @classmethod
+    def requested_fields(cls) -> frozenset[str]:
+        """The non-identity fields a re-registration must state identically: those a caller asked
+        for rather than resolved."""
+        return cls.non_identity_fields - cls.resolved_fields
+
+
+def normalize_page_timestamp(value: str) -> str:
+    if value.isdigit():
+        try:
+            raw = int(value)
+            seconds = raw / 1_000 if len(value) >= 13 else raw
+            parsed = datetime.fromtimestamp(seconds, UTC)
+        except (OSError, OverflowError, ValueError) as error:
+            raise ValueError(f"invalid page timestamp {value!r}") from error
+    else:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError(f"invalid page timestamp {value!r}") from error
+        if parsed.tzinfo is None:
+            if len(value) == 10 and parsed.time() == datetime.min.time():
+                parsed = parsed.replace(tzinfo=UTC)
+            else:
+                raise ValueError(f"page timestamp lacks a timezone: {value!r}")
+        elif parsed.utcoffset() is None:
+            raise ValueError(f"page timestamp lacks a timezone: {value!r}")
+    return parsed.astimezone(UTC).isoformat(timespec="microseconds")
+
+
+class Page(BaseModel):
+    """One fetched document: its source reference, provider identity, body, and browse metadata.
+
+    `parent_fields` are the record fields the streams hanging under this page's stream build their
+    request paths from, projected as the page lands, and None where nothing hangs under it. A
+    child's fan-out reads them off the page, so the collection under this record is reached without
+    re-walking the collection this record came from."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_ref: str
+    source_identity: str | None = None
+    body: str
+    stream: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    created_at: str | None = None
+    updated_at: str | None = None
+    parent_fields: dict[str, FieldValue] | None = None
+
+    @property
+    def digest(self) -> str:
+        return "sha256:" + hashlib.sha256(self.body.encode()).hexdigest()
+
+    @field_validator("created_at", "updated_at")
+    @classmethod
+    def normalize_timestamp(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_page_timestamp(value)
+
+
+class SyncResult(BaseModel):
+    """What a backend's `fetch` returns for one run: the documents the source holds now, the resume
+    cursor, and how the driver reconciles what's gone. `snapshot=True` declares this fetch an
+    authoritative full collection, so the driver tombstones every prior page absent from `pages`.
+    A delta/incremental backend leaves `snapshot=False` and names removals in `deletes` (the
+    source_refs to tombstone), so the driver tombstones only those and never sweeps the pages a
+    partial fetch simply didn't mention.
+
+    `dropped` counts the provider records this run could not represent as a page and discarded. A
+    run that drops every record it fetched is a success by every other signal it emits, so the count
+    rides onto `source_sync.ok`: the event that says what a run wrote says what it lost with it.
+    `retry_after_seconds` makes an incomplete, checkpointed read durable without holding a
+    worker.
+
+    `indexed` is the stream's declaration of whether its pages reach memory, a fact of the run
+    rather than of any page: the driver writes it onto every row of the source each run, so a row
+    an older image landed under the column default agrees with the declaration one interval
+    later."""
+
+    pages: tuple[Page, ...]
+    next_cursor: str | None = None
+    deletes: tuple[str, ...] = ()
+    snapshot: bool = False
+    dropped: int = 0
+    retry_after_seconds: float | None = Field(default=None, gt=0)
+    indexed: bool = True
+
+
+class CursorExpired(Exception):
+    """A `SourceBackend.fetch` raises this when its incremental cursor is no longer valid — a
+    provider delta/sync token the source rejected (aged out, invalidated). The driver clears the
+    stored cursor so the next run refetches from scratch, rather than re-failing on the dead cursor
+    every interval forever."""
+
+
+class StreamSkipped(RuntimeError):
+    """A `SourceBackend.fetch` raises this when the provider refuses this source's stream in a way
+    that is not a data failure — a missing OAuth scope, a disabled workspace object, a plan gate.
+    The driver records the run as skipped, not failed: it commits no pages, so snapshot
+    delete-detection never runs and the source's existing pages stand, and it reschedules at the
+    normal interval with the cursor held and the error counter cleared, rather than backing the
+    source off as if it had errored. It also counts the refusal, and parks the source at
+    `SOURCE_REFUSAL_PARK_THRESHOLD` of them, which writes a warning log and alerts nobody. A raiser
+    therefore does not have to know whether the refusal will clear: one that does costs an hour, and
+    one that does not costs a request an hour instead of a request a minute. A fault the caller can
+    distinguish still reads better as a fault — it raises through and takes the error backoff — but
+    nothing about a stream stopping rests on the caller getting that right.
+
+    `awaits_grant` says the refusal cannot lift on its own, and only a raiser that knows this
+    passes it. A missing scope does not qualify: an administrator widens one out of band and no
+    event reaches us, so the hourly park is the only way that stream is ever found again. A broker
+    reporting the account itself unusable does qualify — it answers that on every read until the
+    member reconnects, and the reconnect is an event `GrantStore.record` already delivers. So the
+    park holds that stream at `SOURCE_PARK_HOLD_SECONDS` rather than the hourly retry: the answer
+    usually arrives another way. It is a hold and not a stop because a broker can be wrong, and a
+    mark only a grant clears would otherwise outlive the fault that wrote it by a year."""
+
+    def __init__(self, reason: str, *, awaits_grant: bool = False) -> None:
+        super().__init__(reason)
+        self.awaits_grant = awaits_grant
+        self.reason = reason
+
+
+def validation_fault(error: ValidationError) -> str:
+    """A rejected model as the field paths and rules that rejected it — `title: string_too_short`.
+    The rejected values stay out of it: they are the provider's payload, or the parameters a member
+    registered a source with, and a record carries neither."""
+    return "; ".join(
+        f"{'.'.join(str(part) for part in item['loc'])}: {item['type']}" for item in error.errors()
+    )
+
+
+def response_fault(response: httpx.Response) -> str:
+    """The reason a refused response names, read from the two envelopes a provider answers a
+    refusal with, each rendered as the refusal beside the code that classifies it.
+
+    A GraphQL endpoint carries a top-level `errors` array: each entry's `message`, and its
+    `extensions.code` where one rides — Linear answers a removed field with `400` and names the
+    field there, and nothing else knows it. A Google API nests its own array under `error` and names
+    the refusal in a closed vocabulary: the `reason` of each `errors` and `details` entry — the
+    older APIs carry the first, the newer ones the second — beside the envelope's canonical
+    `status`, or that status alone where neither array rides. Nothing else separates the unrelated
+    things a Google `403` spells: a quota throttle that clears as the window rolls, a token whose
+    scopes were never granted, and a calendar nobody shared all answer `403`, and only the reason
+    says which, so without it a sweep reads a status and a URL and cannot tell them apart.
+
+    Only those keys ride, never the body whole: an error body echoes the request that drew it —
+    Slack names the token it rejected under `provided` — and a record is not where a credential
+    lands. That is why Google's free-text `message` stays out while its enumerated `reason` rides.
+    A body carrying neither envelope renders nothing, and the fault stays the status and the URL
+    alone."""
+    try:
+        body = response.json()
+    except (ValueError, httpx.ResponseNotRead):
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    error = body.get("error")
+    if isinstance(error, dict):
+        status = error.get("status")
+        status = status if isinstance(status, str) else ""
+        reasons = "; ".join(
+            dict.fromkeys(
+                item["reason"]
+                for item in list_or_empty(error.get("errors")) + list_or_empty(error.get("details"))
+                if isinstance(item.get("reason"), str) and item["reason"]
+            )
+        )
+        if not reasons:
+            return status
+        return f"{reasons} [{status}]" if status else reasons
+    return graphql_fault(body.get("errors"))
+
+
+def graphql_fault(errors: Any) -> str:
+    """A GraphQL `errors` array rendered as each entry's `message` beside its `extensions.code`,
+    and nothing else of the entry: the reason `response_fault` reads off a refused response, for
+    a backend whose endpoint answers `200` with the array in place of `data`."""
+    messages = []
+    for item in list_or_empty(errors):
+        message = item.get("message")
+        if not isinstance(message, str) or not message:
+            continue
+        extensions = item.get("extensions")
+        code = extensions.get("code") if isinstance(extensions, dict) else None
+        messages.append(f"{message} [{code}]" if isinstance(code, str) and code else message)
+    return "; ".join(messages)
+
+
+class StreamFault(RuntimeError):
+    """A `SourceBackend.fetch` raises this when the provider answered with a shape the stream cannot
+    read. The run fails and backs off as any fault does, and `reason` reaches the failure event as
+    its `provider_fault`: the backend authored that text against the request it made, so it names
+    the object and the shape that broke without carrying the provider's payload — the reason a
+    status error's own message never reaches the record."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class SourceAuth:
+    """What the sync runner threads into a backend's `fetch` so it can reach its provider without
+    core minting or holding a token: the workspace the sync runs for, and the selected `auth_proxy`
+    the deploy resolves connector credentials through. A connector backend asks `auth_proxy` for the
+    `Credential` authenticating its provider (a broker's proxying transport, or a member-added key
+    read host-side). `base_url` is the connection's tenant API URL, for the per-tenant providers
+    whose connector class declares no host of its own. `self_user_id` is the live external speaker
+    resolved by a same-named surface, so a source can reject only records the product itself
+    authored. `parents` reads the landed records of a named stream of this same connection, which
+    are the partitions of a stream declaring it a parent — the one connection is the reach, so a row
+    fans out only over records its own authority synced. The folder backend ignores all of it. A
+    value object, never persisted."""
+
+    workspace_id: UUID
+    auth_proxy: AuthProxy | None = None
+    base_url: str | None = None
+    self_user_id: str | None = None
+    parents: ParentPages | None = None
+
+
+SourceIdentityResolver = Callable[[UUID], Awaitable[str | None]]
+
+ConfigT = TypeVar("ConfigT", bound=BaseModel)
+
+
+@runtime_checkable
+class PartitionedBackend(Protocol):
+    """A backend that can say whether a row's cursor is a walk's partition map. `SyncDriver` keeps
+    such a row's cursor in `source.partition_cursor` and every other row's in `source.cursor`, and a
+    backend that cannot say keeps `cursor`."""
+
+    def partitioned(self, config: Mapping[str, object]) -> bool: ...
+
+
+class SourceBackend(Protocol[ConfigT]):
+    """A content-source backend, keyed by its `backend` name onto `source` rows. `config_model` is
+    the typed per-source config the driver validates a row's JSON `config` against — each backend
+    owns its own model, so a source carries typed parameters, never an untyped bag. `fetch` returns
+    the documents the source holds now plus a resume cursor, given that config, the prior `cursor`,
+    and the workspace `auth` the runner threads. A backend that reads a complete collection each run
+    returns `snapshot=True`, and the driver tombstones prior pages the fetch no longer holds; a
+    delta/incremental backend returns `snapshot=False` and names removals explicitly in
+    `SyncResult.deletes`, so the driver tombstones only those and never sweeps pages a partial fetch
+    didn't mention. It raises `CursorExpired` when a stored incremental cursor is rejected by the
+    provider, so the driver clears it and the next run refetches fresh. It raises `StreamSkipped`
+    when the provider refuses the stream for this account (a missing scope, a plan gate), so the
+    driver records the run skipped, not failed — no pages commit, nothing is tombstoned — and
+    reschedules at the normal interval."""
+
+    @property
+    def config_model(self) -> type[ConfigT]: ...
+
+    async def fetch(self, config: ConfigT, cursor: str | None, auth: SourceAuth) -> SyncResult: ...
+
+
+@dataclass(frozen=True)
+class FolderSource:
+    """Reads a local directory into pages: each file becomes one page keyed by its path relative to
+    the root, digested by content, scoped to the shared subject. A full scan each sync — the driver
+    skips unchanged pages by digest and tombstones pages whose file is gone. A file removed from a
+    present folder tombstones its page; the whole folder going missing instead raises, so the sync
+    fails closed (a transient mount blip can't sweep the index) — purge a folder's docs by emptying
+    it or removing the source, never by deleting the folder."""
+
+    config_model: ClassVar[type[SourceConfig]] = SourceConfig
+
+    async def fetch(self, config: SourceConfig, cursor: str | None, auth: SourceAuth) -> SyncResult:
+        entries = await asyncio.to_thread(self._read, Path(config.root))
+        pages = tuple(
+            Page(
+                source_ref=source_ref,
+                body=text,
+                stream="files",
+                title=source_ref,
+                updated_at=modified,
+            )
+            for source_ref, text, modified in entries
+        )
+        return SyncResult(pages=pages, next_cursor=None, snapshot=True)
+
+    @staticmethod
+    def _read(root: Path) -> tuple[tuple[str, str, str], ...]:
+        if not root.is_dir():
+            raise FileNotFoundError(f"source folder not found: {root}")
+        return tuple(
+            (
+                str(path.relative_to(root)),
+                path.read_bytes().decode("utf-8"),
+                datetime.fromtimestamp(path.stat().st_mtime, UTC).isoformat(),
+            )
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        )
+
+
+def feed_handle_for(config: Mapping[str, object], non_identity_keys: frozenset[str]) -> str:
+    """The identity string `source.feed_handle` stores: the config minus its declared non-identity
+    keys, dumped with sorted keys so one dataset spells one string."""
+    return json.dumps(
+        {key: value for key, value in config.items() if key not in non_identity_keys},
+        sort_keys=True,
+    )
+
+
+def feed_handle(config: BaseModel) -> str:
+    """The connection `account_id` of a feed that names no broker account and no member — a
+    repository, a folder root: its config's identity, the very string `source.feed_handle` stores.
+    The `[[sources]]` boot path and an extension's object kind both mint the connection from it,
+    so one root registered by either settles on one connection, and two roots of one backend are two
+    connections — deleting one cascades none of the other's rows or pages. It begins `{`, which no
+    broker's account id does, so `brokered_account` reads it as no account and the feed routes to
+    the workspace's key."""
+    non_identity = (
+        type(config).non_identity_fields
+        if isinstance(config, SourceRowConfig)
+        else frozenset[str]()
+    )
+    return feed_handle_for(config.model_dump(mode="json"), non_identity)
+
+
+def source_body_ref_matches(body_ref: str, source_id: UUID, page_id: UUID, digest: str) -> bool:
+    """Whether a blob ref names this page's content under one source-sync claim."""
+    prefix = f"{SOURCE_BLOB_PREFIX}/{source_id}/{page_id}/"
+    suffix = f"/{digest.removeprefix('sha256:')}"
+    claim = body_ref.removeprefix(prefix).removesuffix(suffix)
+    return (
+        body_ref.startswith(prefix)
+        and body_ref.endswith(suffix)
+        and len(claim) == 32
+        and set(claim) <= set("0123456789abcdef")
+    )
+
+
+async def register_sources(configured: tuple[SourceEntry, ...]) -> tuple[UUID, ...]:
+    """Ensure a source row exists in the bound workspace for each configured `[[sources]]` entry,
+    each hanging off a connection of its own keyed by `feed_handle` — the authority a feed no member
+    owns runs under, shared because nobody owns it, and one per feed so removing one root never
+    takes another's pages. A row is keyed by workspace, connection, backend and feed handle, so a
+    restart re-registers the same rows without duplicating them; the rows settled on come back in
+    entry order. Runs once at boot, off the sync poll."""
+    now = datetime.now(UTC)
+    settled: list[UUID] = []
+    workspace_id = ws_current().workspace_id
+    async with workspace_tx() as connection:
+        insert = pg_insert if connection.dialect.name == "postgresql" else sqlite_insert
+        for entry in configured:
+            handle = feed_handle(entry.config)
+            await connection.execute(
+                insert(tables.connection)
+                .values(
+                    id=uuid4(),
+                    workspace_id=workspace_id,
+                    provider=entry.backend,
+                    account_id=handle,
+                    host="",
+                    owner_member_id=None,
+                    shared=True,
+                    created_at=sa.func.now(),
+                    updated_at=sa.func.now(),
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        tables.connection.c.workspace_id,
+                        tables.connection.c.provider,
+                        tables.connection.c.account_id,
+                    ]
+                )
+            )
+            connection_id = (
+                await connection.execute(
+                    sa.select(tables.connection.c.id).where(
+                        tables.connection.c.workspace_id == workspace_id,
+                        tables.connection.c.provider == entry.backend,
+                        tables.connection.c.account_id == handle,
+                    )
+                )
+            ).scalar_one()
+            config = entry.config.model_dump(mode="json")
+            await connection.execute(
+                insert(tables.source)
+                .values(
+                    uid=uuid7(),
+                    workspace_id=workspace_id,
+                    backend=entry.backend,
+                    config=config,
+                    feed_handle=feed_handle_for(config, frozenset()),
+                    connection_id=connection_id,
+                    cursor=None,
+                    next_sync_at=now,
+                    claimed_by=None,
+                    claim_expires_at=None,
+                    created_at=sa.func.now(),
+                    updated_at=sa.func.now(),
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        tables.source.c.workspace_id,
+                        tables.source.c.connection_id,
+                        tables.source.c.backend,
+                        tables.source.c.feed_handle,
+                    ]
+                )
+            )
+            settled.append(
+                (
+                    await connection.execute(
+                        sa.select(tables.source.c.uid).where(
+                            tables.source.c.workspace_id == workspace_id,
+                            tables.source.c.connection_id == connection_id,
+                            tables.source.c.backend == entry.backend,
+                            tables.source.c.feed_handle == feed_handle_for(config, frozenset()),
+                        )
+                    )
+                ).scalar_one()
+            )
+    return tuple(settled)
+
+
+CursorWrite = str | None | sa.ColumnElement[Any]
+
+
+@dataclass(frozen=True)
+class ClaimedSource:
+    """One due row this run holds the claim on. Both cursor columns are read off the row and exactly
+    one is this row's: `partitioned` says which, decided once at the claim from the backend's own
+    declaration, and `resume` and `advanced` are the only readers of the pair."""
+
+    source_uid: UUID
+    workspace_id: UUID
+    claim: str
+    backend: str
+    config: Mapping[str, object]
+    connection_id: UUID
+    account_id: str
+    base_url: str | None
+    cursor: str | None
+    partition_cursor: str | None
+    partitioned: bool
+    consecutive_errors: int
+    claimed_at: datetime
+
+    @property
+    def resume(self) -> str | None:
+        """Where this row's next run starts: its partition map, or its watermark."""
+        return self.partition_cursor if self.partitioned else self.cursor
+
+    def advanced(self, cursor: str | None) -> tuple[CursorWrite, CursorWrite]:
+        """What a run of this row writes to `cursor` and to `partition_cursor`, in that order: the
+        column the row lives in takes the value, the other is assigned itself, so the image being
+        replaced still reads exactly what it wrote there."""
+        if self.partitioned:
+            return tables.source.c.cursor, cursor
+        return cursor, tables.source.c.partition_cursor
+
+
+def _rescheduled(claimed: ClaimedSource, when: datetime | sa.Case[datetime]) -> sa.Case[datetime]:
+    """`schedule_source_sync` writes `next_sync_at=now` under a live claim, so a value later than
+    this claim's start is a resync this run never covered."""
+    return sa.case(
+        (tables.source.c.next_sync_at <= claimed.claimed_at, when),
+        else_=tables.source.c.next_sync_at,
+    )
+
+
+def _stream_tags(source: ClaimedSource) -> dict[str, str]:
+    return {"provider": source.backend, "stream": _config_value(source, "stream")}
+
+
+def _check_tags(source: ClaimedSource) -> dict[str, str]:
+    """Datadog keys a check instance by name, host and tags together, so without the row id every
+    row sharing a stream shares one status history."""
+    return {**_stream_tags(source), "source_id": str(source.source_uid)}
+
+
+def _config_value(source: ClaimedSource, key: str) -> str:
+    value = source.config.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def _database_unreachable(error: BaseException) -> bool:
+    """A dial that never landed raises the socket's own `TimeoutError` or `OSError`, which the
+    provider fetch and the blob volume raise too, so it stays a sync failure."""
+    if isinstance(error, sa_exc.TimeoutError | sa_exc.InterfaceError):
+        return True
+    if isinstance(error, sa_exc.OperationalError):
+        return isinstance(error.orig, _ASYNCPG_CONNECTION_ERRORS)
+    return False
+
+
+@dataclass(frozen=True)
+class PageBrowse:
+    id: UUID
+    source_identity: str | None
+    stream: str
+    title: str
+    record_created_at: str | None
+    record_updated_at: str | None
+    parent_fields: dict[str, FieldValue] | None
+
+
+@dataclass(frozen=True)
+class ChangedPage:
+    browse: PageBrowse
+    body_ref: str
+    digest: str
+
+
+class _SourceClaimLost(RuntimeError):
+    pass
+
+
+def _source_authority() -> sa.Join:
+    """A source joined to the connection that authorizes it — the reach an agent is granted and the
+    disclosure every page it syncs carries. Every source has one, so this is an inner join."""
+    return tables.source.join(
+        tables.connection,
+        sa.and_(
+            tables.connection.c.workspace_id == tables.source.c.workspace_id,
+            tables.connection.c.id == tables.source.c.connection_id,
+        ),
+    )
+
+
+def _readers_remain() -> sa.ColumnElement[bool]:
+    """Each subquery names its own FROM: left to inference, the shared-connection arm raises under a
+    joined caller and tests every connection under a bare one."""
+    granted = (
+        sa.select(sa.literal(1))
+        .select_from(tables.connector_grant)
+        .where(
+            tables.connector_grant.c.workspace_id == tables.source.c.workspace_id,
+            tables.connector_grant.c.connection_id == tables.source.c.connection_id,
+        )
+        .correlate(tables.source)
+    )
+    granted_to_a_live_agent = (
+        sa.select(sa.literal(1))
+        .select_from(
+            tables.connector_grant.join(
+                tables.agent,
+                sa.and_(
+                    tables.agent.c.workspace_id == tables.connector_grant.c.workspace_id,
+                    tables.agent.c.id == tables.connector_grant.c.agent_id,
+                ),
+            )
+        )
+        .where(
+            tables.connector_grant.c.workspace_id == tables.source.c.workspace_id,
+            tables.connector_grant.c.connection_id == tables.source.c.connection_id,
+            tables.agent.c.archived_at.is_(None),
+        )
+        .correlate(tables.source)
+    )
+    read_by_a_live_main = (
+        sa.select(sa.literal(1))
+        .select_from(tables.agent)
+        .where(
+            tables.agent.c.workspace_id == tables.source.c.workspace_id,
+            tables.agent.c.is_main.is_(True),
+            tables.agent.c.archived_at.is_(None),
+        )
+        .correlate(tables.source)
+    )
+    shared_connection = (
+        sa.select(sa.literal(1))
+        .select_from(tables.connection)
+        .where(
+            tables.connection.c.workspace_id == tables.source.c.workspace_id,
+            tables.connection.c.id == tables.source.c.connection_id,
+            tables.connection.c.shared,
+        )
+        .correlate(tables.source)
+    )
+    return sa.or_(
+        ~sa.exists(granted),
+        sa.exists(granted_to_a_live_agent),
+        sa.and_(sa.exists(shared_connection), sa.exists(read_by_a_live_main)),
+    )
+
+
+def run_claim(workflow_id: str | None) -> str:
+    """The claim a sync run holds its rows under. Inside a DBOS workflow it is fixed by the workflow
+    id, so a run that recovery replays after its process died takes back the rows its first attempt
+    claimed instead of waiting out `CLAIM_LEASE_SECONDS` on each: a deploy roll that killed a run
+    held every due source of that workspace for five minutes. Outside a workflow nothing replays."""
+    if workflow_id is None:
+        return uuid4().hex
+    return uuid5(NAMESPACE_URL, f"source-sync:{workflow_id}").hex
+
+
+@dataclass(frozen=True)
+class SyncDriver:
+    """The core sync job: for the workspace the dispatcher bound, claim its due sources, fetch each
+    backend, and commit its pages — the claim and every write filter on that workspace. Runs
+    downward — claim, fetch, commit — one source at a time. Every claimed row renews while it waits
+    or fetches, so a slow backend cannot let this worker's later claims expire into a second run.
+    `candidate_workspaces` names the workspaces holding a due source through one `owner_tx` read, so
+    the dispatcher binds only those and a workspace with nothing due is never opened. On a
+    per-tenant deploy `owner_tx` resolves to the single workspace, unchanged. Due means readable
+    too: a source the archive took every reader from is nobody's feed, so it is neither a candidate
+    nor claimed until a restore gives it one back. A parked row — one the provider refused often
+    enough that `_skip` slowed it to an hour — is due like any other row, an hour out instead of a
+    minute. A workspace the spend gates hold (`SpendGates.admitting`) holds nothing due at all, and
+    its rows come back when the gates let it go."""
+
+    backends: Mapping[str, SourceBackend]
+    blob: WorkspaceBlobStore
+    postgres: bool
+    source_credentials: SourceCredentialResolver | None = None
+    identity_resolvers: Mapping[str, SourceIdentityResolver] = field(default_factory=dict)
+    spend: SpendGates = NO_SPEND_GATES
+
+    async def candidate_workspaces(self) -> tuple[UUID, ...]:
+        """Workspaces holding a source due for sync — one distinct `workspace_id` per such
+        workspace, found in a single `owner_tx` read, pinned to no workspace and run as the owner
+        role RLS policies exempt, so the dispatcher binds only those and a workspace with nothing
+        due runs no per-workspace transaction on the tick."""
+        now = datetime.now(UTC)
+        async with owner_tx() as connection:
+            rows = (
+                await connection.execute(
+                    sa.select(tables.source.c.workspace_id)
+                    .where(
+                        tables.source.c.next_sync_at <= now,
+                        sa.or_(
+                            tables.source.c.claimed_by.is_(None),
+                            tables.source.c.claim_expires_at < now,
+                        ),
+                        _readers_remain(),
+                        self.spend.admitting(tables.source.c.workspace_id),
+                    )
+                    .distinct()
+                )
+            ).all()
+        return tuple(row.workspace_id for row in rows)
+
+    async def run(self) -> None:
+        claim = run_claim(DBOS.workflow_id)
+        sources = await self._claim_due(claim)
+        renewals = {
+            source.source_uid: asyncio.create_task(self._renew_claim(source)) for source in sources
+        }
+        grouped: dict[UUID, list[ClaimedSource]] = {}
+        for source in sources:
+            grouped.setdefault(source.connection_id, []).append(source)
+        limit = asyncio.Semaphore(SOURCE_CONNECTION_CONCURRENCY)
+        try:
+            async with asyncio.TaskGroup() as running:
+                for group in grouped.values():
+                    running.create_task(self._run_connection(tuple(group), renewals, limit))
+        finally:
+            for renewal in renewals.values():
+                if not renewal.done():
+                    renewal.cancel()
+            await asyncio.gather(*renewals.values(), return_exceptions=True)
+
+    async def _run_connection(
+        self,
+        sources: tuple[ClaimedSource, ...],
+        renewals: Mapping[UUID, asyncio.Task[None]],
+        limit: asyncio.Semaphore,
+    ) -> None:
+        async with limit:
+            for index, source in enumerate(sources):
+                rate_limited = await self._run_with_lease(source, renewals[source.source_uid])
+                if not rate_limited:
+                    continue
+                remaining = sources[index + 1 :]
+                for sibling in remaining:
+                    renewal = renewals[sibling.source_uid]
+                    if not renewal.done():
+                        renewal.cancel()
+                await asyncio.gather(
+                    *(renewals[sibling.source_uid] for sibling in remaining),
+                    return_exceptions=True,
+                )
+                return
+
+    async def _run_with_lease(self, source: ClaimedSource, renewal: asyncio.Task[None]) -> bool:
+        sync_task = asyncio.create_task(self._sync_claimed(source))
+        try:
+            done, _pending = await asyncio.wait(
+                (sync_task, renewal), return_when=asyncio.FIRST_COMPLETED
+            )
+            if sync_task not in done:
+                if renewal.cancelled():
+                    raise asyncio.CancelledError
+                error = renewal.exception()
+                if error is None:
+                    raise RuntimeError("source claim renewal stopped")
+                raise error
+            return await sync_task
+        except _SourceClaimLost:
+            log("source_sync.claim_lost", source_id=str(source.source_uid), **_stream_tags(source))
+            return False
+        finally:
+            for task in (sync_task, renewal):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sync_task, renewal, return_exceptions=True)
+
+    async def _sync_claimed(self, source: ClaimedSource) -> bool:
+        with suppress(Exception):
+            log(
+                "source_sync.started",
+                source_id=str(source.source_uid),
+                **_stream_tags(source),
+                account_id=source.account_id,
+            )
+        try:
+            result = await self._fetch(source)
+            await self._commit(source, result)
+            return result.retry_after_seconds is not None
+        except _SourceClaimLost:
+            raise
+        except StreamSkipped as skipped:
+            with suppress(Exception):
+                log(
+                    "source_sync.skipped",
+                    source_id=str(source.source_uid),
+                    **_stream_tags(source),
+                    reason=skipped.reason,
+                )
+            await self._skip(source, skipped.reason, awaits_grant=skipped.awaits_grant)
+            return False
+        except Exception as error:
+            if _database_unreachable(error):
+                await self._defer(source, error)
+                return False
+            cursor_reset = isinstance(error, CursorExpired)
+            errors, next_sync_at = self._error_backoff(source, datetime.now(UTC))
+            await self._report_failed(source, error, cursor_reset, errors, next_sync_at)
+            await self._release(source, cursor_reset, errors, next_sync_at)
+            return False
+
+    async def _renew_claim(self, source: ClaimedSource) -> None:
+        while True:
+            await asyncio.sleep(CLAIM_REFRESH_SECONDS)
+            await self._refresh_claim(source)
+
+    async def _refresh_claim(self, source: ClaimedSource) -> None:
+        now = datetime.now(UTC)
+        async with workspace_tx() as connection:
+            renewed = await connection.execute(
+                sa.update(tables.source)
+                .where(
+                    tables.source.c.workspace_id == source.workspace_id,
+                    tables.source.c.uid == source.source_uid,
+                    tables.source.c.claimed_by == source.claim,
+                )
+                .values(
+                    claim_expires_at=now + timedelta(seconds=CLAIM_LEASE_SECONDS),
+                    updated_at=sa.func.now(),
+                )
+            )
+        if renewed.rowcount != 1:
+            raise _SourceClaimLost(str(source.source_uid))
+
+    async def _claim_due(self, claim: str) -> tuple[ClaimedSource, ...]:
+        now = datetime.now(UTC)
+        due = (
+            sa.select(
+                tables.source.c.uid,
+                tables.source.c.workspace_id,
+                tables.source.c.backend,
+                tables.source.c.config,
+                tables.source.c.connection_id,
+                tables.connection.c.account_id,
+                tables.connection.c.base_url,
+                tables.source.c.cursor,
+                tables.source.c.partition_cursor,
+                tables.source.c.consecutive_errors,
+            )
+            .select_from(_source_authority())
+            .where(
+                tables.source.c.workspace_id == ws_current().workspace_id,
+                tables.source.c.next_sync_at <= now,
+                sa.or_(
+                    tables.source.c.claimed_by.is_(None),
+                    tables.source.c.claimed_by == claim,
+                    tables.source.c.claim_expires_at < now,
+                ),
+                _readers_remain(),
+                self.spend.admitting(tables.source.c.workspace_id),
+            )
+            .order_by(tables.source.c.next_sync_at, tables.source.c.uid)
+            .limit(DUE_BATCH_MAX_SOURCES)
+        )
+        if self.postgres:
+            due = due.with_for_update(skip_locked=True, of=tables.source)
+        expires = now + timedelta(seconds=CLAIM_LEASE_SECONDS)
+        async with workspace_tx() as connection:
+            rows = (await connection.execute(due)).mappings().all()
+            if rows:
+                await connection.execute(
+                    sa.update(tables.source)
+                    .values(claimed_by=claim, claim_expires_at=expires, updated_at=sa.func.now())
+                    .where(tables.source.c.uid.in_([row["uid"] for row in rows]))
+                )
+        claimed: list[ClaimedSource] = []
+        for row in rows:
+            backend = self.backends.get(row["backend"])
+            claimed.append(
+                ClaimedSource(
+                    source_uid=row["uid"],
+                    workspace_id=row["workspace_id"],
+                    claim=claim,
+                    backend=row["backend"],
+                    config=row["config"],
+                    connection_id=row["connection_id"],
+                    account_id=row["account_id"],
+                    base_url=row["base_url"],
+                    cursor=row["cursor"],
+                    partition_cursor=row["partition_cursor"],
+                    partitioned=(
+                        isinstance(backend, PartitionedBackend)
+                        and backend.partitioned(row["config"])
+                    ),
+                    consecutive_errors=row["consecutive_errors"],
+                    claimed_at=now,
+                )
+            )
+        return tuple(claimed)
+
+    async def _fetch(self, source: ClaimedSource) -> SyncResult:
+        backend = self.backends.get(source.backend)
+        if backend is None:
+            raise RuntimeError(f"no source backend for {source.backend!r}")
+        config = backend.config_model.model_validate(source.config)
+        resolver = self.identity_resolvers.get(source.backend)
+        self_user_id = None if resolver is None else await resolver(source.workspace_id)
+        auth = SourceAuth(
+            workspace_id=source.workspace_id,
+            auth_proxy=(
+                None
+                if self.source_credentials is None
+                else self.source_credentials.bind(source.connection_id)
+            ),
+            base_url=source.base_url,
+            self_user_id=self_user_id,
+            parents=partial(self._parent_pages, source),
+        )
+        return await backend.fetch(config, source.resume, auth)
+
+    async def _parent_pages(
+        self, source: ClaimedSource, stream: str
+    ) -> AsyncIterator[ParentRecord | UnprojectedParent | UnreadyParent]:
+        """`revision` is the database's workspace-wide counter and moves only with a page's body,
+        disclosure or liveness, so a projection backfill does not read as a change."""
+        async with workspace_tx() as connection:
+            rows = (
+                (
+                    await connection.execute(
+                        sa.select(
+                            tables.source.c.uid,
+                            tables.source.c.config,
+                            tables.source.c.synced_at,
+                        ).where(
+                            tables.source.c.workspace_id == source.workspace_id,
+                            tables.source.c.connection_id == source.connection_id,
+                            tables.source.c.backend == source.backend,
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            parent_rows = [row for row in rows if row["config"].get("stream") == stream]
+            holders = [row["uid"] for row in parent_rows]
+            if not holders:
+                return
+            pages = (
+                (
+                    await connection.execute(
+                        sa.select(
+                            tables.page.c.source_uid,
+                            tables.page.c.source_identity,
+                            tables.page.c.parent_fields,
+                            tables.page.c.revision,
+                        ).where(
+                            tables.page.c.workspace_id == source.workspace_id,
+                            tables.page.c.source_uid.in_(holders),
+                            tables.page.c.tombstone.is_(False),
+                            tables.page.c.source_identity.is_not(None),
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        page_sources = {row["source_uid"] for row in pages}
+        if any(row["synced_at"] is None and row["uid"] not in page_sources for row in parent_rows):
+            yield UnreadyParent()
+        for row in pages:
+            if row["parent_fields"] is None:
+                yield UnprojectedParent(ref=row["source_identity"])
+                continue
+            yield ParentRecord(
+                ref=row["source_identity"],
+                fields=row["parent_fields"],
+                revision=row["revision"],
+            )
+
+    async def _commit(self, source: ClaimedSource, result: SyncResult) -> None:
+        await self._refresh_claim(source)
+        _, prior_by_identity = await self._prior_pages(source)
+        resolved: dict[str, UUID] = {
+            identity: value[2].id for identity, value in prior_by_identity.items()
+        }
+        fetched: list[UUID] = []
+        changed: list[ChangedPage] = []
+        metadata: list[PageBrowse] = []
+        written: list[str] = []
+        try:
+            for page in result.pages:
+                source_identity = page.source_identity or page.source_ref
+                existing = prior_by_identity.get(source_identity)
+                page_id = resolved.get(source_identity)
+                if page_id is None and (attaching := prior_by_identity.get(page.source_ref)):
+                    existing = attaching
+                    page_id = attaching[2].id
+                if page_id is None:
+                    page_id = uuid7()
+                resolved[source_identity] = page_id
+                fetched.append(page_id)
+                browse = PageBrowse(
+                    id=page_id,
+                    source_identity=source_identity,
+                    stream=page.stream,
+                    title=page.title,
+                    record_created_at=page.created_at,
+                    record_updated_at=page.updated_at,
+                    parent_fields=page.parent_fields,
+                )
+                if existing is None or existing[:2] != (page.digest, False):
+                    body_ref = (
+                        f"{SOURCE_BLOB_PREFIX}/{source.source_uid}/{page_id}/{source.claim}/"
+                        f"{page.digest.removeprefix('sha256:')}"
+                    )
+                    written.append(body_ref)
+                    await self.blob.put(body_ref, page.body.encode())
+                    changed.append(
+                        ChangedPage(
+                            browse=browse,
+                            body_ref=body_ref,
+                            digest=page.digest,
+                        )
+                    )
+                elif existing[2] != browse:
+                    metadata.append(browse)
+            deleted = [
+                existing[2].id
+                for ref in result.deletes
+                if (existing := prior_by_identity.get(ref)) is not None
+                and existing[2].id not in fetched
+            ]
+            try:
+                tombstoned, retry_at = await self._write(
+                    source,
+                    result.next_cursor,
+                    changed,
+                    metadata,
+                    fetched,
+                    deleted,
+                    result.snapshot,
+                    result.retry_after_seconds,
+                    result.indexed,
+                )
+            except asyncio.CancelledError:
+                written.clear()
+                raise
+        except BaseException as error:
+            results = await asyncio.gather(
+                *(self.blob.delete(body_ref) for body_ref in written),
+                return_exceptions=True,
+            )
+            failures = [result for result in results if isinstance(result, BaseException)]
+            if failures:
+                raise BaseExceptionGroup(
+                    "source commit and blob cleanup failed", [error, *failures]
+                ) from None
+            raise
+        if retry_at is not None:
+            with suppress(Exception):
+                warn(
+                    "source_sync.rate_limited",
+                    source_id=str(source.source_uid),
+                    **_stream_tags(source),
+                    account_id=source.account_id,
+                    pages_fetched=len(result.pages),
+                    pages_written=len(changed) + len(metadata),
+                    pages_dropped=result.dropped,
+                    retry_at=retry_at.isoformat(),
+                )
+        else:
+            await self._report_ok(
+                source,
+                len(result.pages),
+                len(changed) + len(metadata),
+                tombstoned,
+                result.dropped,
+            )
+
+    async def _prior_pages(
+        self, source: ClaimedSource
+    ) -> tuple[
+        dict[UUID, tuple[str, bool, PageBrowse]],
+        dict[str, tuple[str, bool, PageBrowse]],
+    ]:
+        async with workspace_tx() as connection:
+            rows = (
+                (
+                    await connection.execute(
+                        sa.select(
+                            tables.page.c.uid.label("id"),
+                            tables.page.c.source_identity,
+                            tables.page.c.digest,
+                            tables.page.c.tombstone,
+                            tables.page.c.stream,
+                            tables.page.c.title,
+                            tables.page.c.record_created_at,
+                            tables.page.c.record_updated_at,
+                            tables.page.c.parent_fields,
+                        ).where(
+                            tables.page.c.workspace_id == source.workspace_id,
+                            tables.page.c.source_uid == source.source_uid,
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        by_id = {
+            row["id"]: (
+                row["digest"],
+                bool(row["tombstone"]),
+                PageBrowse(
+                    id=row["id"],
+                    source_identity=row["source_identity"],
+                    stream=row["stream"],
+                    title=row["title"],
+                    record_created_at=row["record_created_at"],
+                    record_updated_at=row["record_updated_at"],
+                    parent_fields=row["parent_fields"],
+                ),
+            )
+            for row in rows
+        }
+        return by_id, {
+            page.source_identity: prior
+            for prior in by_id.values()
+            if (page := prior[2]).source_identity is not None
+        }
+
+    async def _write(
+        self,
+        source: ClaimedSource,
+        next_cursor: str | None,
+        changed: list[ChangedPage],
+        metadata: list[PageBrowse],
+        fetched: list[UUID],
+        deleted: list[UUID],
+        snapshot: bool,
+        retry_after_seconds: float | None,
+        indexed: bool,
+    ) -> tuple[int, datetime | None]:
+        """Locks the connection row too: with only the source locked, a concurrent `set_shared`
+        could be undone by this run's trailing page stamp."""
+        now = datetime.now(UTC)
+        retry_at = (
+            None if retry_after_seconds is None else now + timedelta(seconds=retry_after_seconds)
+        )
+        workspace_id = source.workspace_id
+        async with workspace_tx() as connection:
+            authority = (
+                sa.select(tables.connection.c.shared, tables.connection.c.owner_member_id)
+                .select_from(_source_authority())
+                .where(
+                    tables.source.c.uid == source.source_uid,
+                    tables.source.c.workspace_id == workspace_id,
+                    tables.source.c.claimed_by == source.claim,
+                )
+            )
+            if connection.dialect.name == "postgresql":
+                authority = authority.with_for_update(of=(tables.source, tables.connection))
+            held = (await connection.execute(authority)).one_or_none()
+            if held is None:
+                raise _SourceClaimLost(str(source.source_uid))
+            subject = connection_subject(held.shared, held.owner_member_id)
+            await connection.execute(
+                sa.update(tables.page)
+                .values(indexed=indexed, updated_at=now)
+                .where(
+                    tables.page.c.workspace_id == workspace_id,
+                    tables.page.c.source_uid == source.source_uid,
+                    tables.page.c.indexed.is_distinct_from(indexed),
+                )
+            )
+            for changed_page in changed:
+                updated = await connection.execute(
+                    sa.update(tables.page)
+                    .values(
+                        source_identity=changed_page.browse.source_identity,
+                        digest=changed_page.digest,
+                        body_ref=changed_page.body_ref,
+                        stream=changed_page.browse.stream,
+                        title=changed_page.browse.title,
+                        record_created_at=changed_page.browse.record_created_at,
+                        record_updated_at=changed_page.browse.record_updated_at,
+                        parent_fields=changed_page.browse.parent_fields,
+                        subject=subject,
+                        tombstone=False,
+                        updated_at=now,
+                    )
+                    .where(
+                        tables.page.c.workspace_id == workspace_id,
+                        tables.page.c.uid == changed_page.browse.id,
+                    )
+                )
+                if updated.rowcount == 0:
+                    await connection.execute(
+                        sa.insert(tables.page).values(
+                            uid=changed_page.browse.id,
+                            source_identity=changed_page.browse.source_identity,
+                            workspace_id=workspace_id,
+                            source_uid=source.source_uid,
+                            digest=changed_page.digest,
+                            body_ref=changed_page.body_ref,
+                            stream=changed_page.browse.stream,
+                            title=changed_page.browse.title,
+                            record_created_at=changed_page.browse.record_created_at,
+                            record_updated_at=changed_page.browse.record_updated_at,
+                            parent_fields=changed_page.browse.parent_fields,
+                            indexed=indexed,
+                            subject=subject,
+                            tombstone=False,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+            for browse_page in metadata:
+                await connection.execute(
+                    sa.update(tables.page)
+                    .values(
+                        source_identity=browse_page.source_identity,
+                        stream=browse_page.stream,
+                        title=browse_page.title,
+                        record_created_at=browse_page.record_created_at,
+                        record_updated_at=browse_page.record_updated_at,
+                        parent_fields=browse_page.parent_fields,
+                    )
+                    .where(
+                        tables.page.c.workspace_id == workspace_id,
+                        tables.page.c.uid == browse_page.id,
+                    )
+                )
+            tombstoned = 0
+            if deleted:
+                swept = await connection.execute(
+                    sa.update(tables.page)
+                    .values(tombstone=True, updated_at=now)
+                    .where(
+                        tables.page.c.workspace_id == workspace_id,
+                        tables.page.c.source_uid == source.source_uid,
+                        tables.page.c.tombstone.is_(False),
+                        tables.page.c.uid.in_(deleted),
+                    )
+                )
+                tombstoned += swept.rowcount
+            if snapshot:
+                swept = await connection.execute(
+                    sa.update(tables.page)
+                    .values(tombstone=True, updated_at=now)
+                    .where(
+                        tables.page.c.workspace_id == workspace_id,
+                        tables.page.c.source_uid == source.source_uid,
+                        tables.page.c.tombstone.is_(False),
+                        tables.page.c.uid.not_in(fetched),
+                    )
+                )
+                tombstoned += swept.rowcount
+            await connection.execute(
+                sa.update(tables.page)
+                .values(subject=subject, updated_at=now)
+                .where(
+                    tables.page.c.workspace_id == workspace_id,
+                    tables.page.c.source_uid == source.source_uid,
+                    tables.page.c.tombstone.is_(False),
+                    tables.page.c.subject != subject,
+                )
+            )
+            landed = bool(changed) or bool(deleted) or tombstoned > 0
+            empty_runs = (
+                tables.source.c.consecutive_empty
+                if retry_at is not None
+                else (sa.literal(0) if landed else tables.source.c.consecutive_empty + 1)
+            )
+            never_landed = ~sa.exists(
+                sa.select(sa.literal(1))
+                .select_from(tables.page)
+                .where(
+                    tables.page.c.workspace_id == workspace_id,
+                    tables.page.c.source_uid == source.source_uid,
+                )
+                .correlate()
+            )
+            idles = sa.and_(empty_runs >= SOURCE_EMPTY_IDLE_THRESHOLD, never_landed)
+            cursor, partition_cursor = source.advanced(next_cursor)
+            await connection.execute(
+                sa.update(tables.source)
+                .values(
+                    cursor=cursor,
+                    partition_cursor=partition_cursor,
+                    next_sync_at=(
+                        sa.case(
+                            (tables.source.c.next_sync_at < retry_at, retry_at),
+                            else_=tables.source.c.next_sync_at,
+                        )
+                        if retry_at is not None
+                        else _rescheduled(
+                            source,
+                            sa.case(
+                                (idles, now + timedelta(seconds=SOURCE_EMPTY_IDLE_SECONDS)),
+                                else_=now + timedelta(seconds=SOURCE_SYNC_INTERVAL_SECONDS),
+                            ),
+                        )
+                    ),
+                    consecutive_errors=(
+                        tables.source.c.consecutive_errors if retry_at is not None else 0
+                    ),
+                    consecutive_refusals=(
+                        tables.source.c.consecutive_refusals if retry_at is not None else 0
+                    ),
+                    consecutive_empty=empty_runs,
+                    synced_at=tables.source.c.synced_at if retry_at is not None else now,
+                    parked_at=tables.source.c.parked_at if retry_at is not None else None,
+                    parked_since=(tables.source.c.parked_since if retry_at is not None else None),
+                    parked_awaits_grant=(
+                        tables.source.c.parked_awaits_grant if retry_at is not None else False
+                    ),
+                    parked_reason=tables.source.c.parked_reason if retry_at is not None else None,
+                    claimed_by=None,
+                    claim_expires_at=None,
+                    updated_at=sa.func.now(),
+                )
+                .where(
+                    tables.source.c.workspace_id == workspace_id,
+                    tables.source.c.uid == source.source_uid,
+                    tables.source.c.claimed_by == source.claim,
+                )
+            )
+            if retry_at is not None:
+                await connection.execute(
+                    sa.update(tables.source)
+                    .values(
+                        next_sync_at=sa.case(
+                            (tables.source.c.next_sync_at < retry_at, retry_at),
+                            else_=tables.source.c.next_sync_at,
+                        ),
+                        updated_at=sa.func.now(),
+                    )
+                    .where(
+                        tables.source.c.workspace_id == workspace_id,
+                        tables.source.c.connection_id == source.connection_id,
+                    )
+                )
+                await connection.execute(
+                    sa.update(tables.source)
+                    .values(
+                        claimed_by=None,
+                        claim_expires_at=None,
+                        updated_at=sa.func.now(),
+                    )
+                    .where(
+                        tables.source.c.workspace_id == workspace_id,
+                        tables.source.c.connection_id == source.connection_id,
+                        tables.source.c.claimed_by == source.claim,
+                    )
+                )
+        return tombstoned, retry_at
+
+    async def _report_ok(
+        self, source: ClaimedSource, fetched: int, written: int, tombstoned: int, dropped: int
+    ) -> None:
+        tags = _stream_tags(source)
+        with suppress(Exception):
+            log(
+                "source_sync.ok",
+                source_id=str(source.source_uid),
+                **tags,
+                account_id=source.account_id,
+                pages_fetched=fetched,
+                pages_written=written,
+                pages_tombstoned=tombstoned,
+                pages_dropped=dropped,
+            )
+        with suppress(Exception):
+            await emit_service_check(SOURCE_SYNC_CHECK, SERVICE_CHECK_OK, **_check_tags(source))
+
+    def _error_backoff(self, source: ClaimedSource, now: datetime) -> tuple[int, datetime]:
+        errors = source.consecutive_errors + 1
+        backoff = min(
+            SOURCE_SYNC_INTERVAL_SECONDS * 2 ** (errors - 1), SOURCE_ERROR_BACKOFF_CAP_SECONDS
+        )
+        return errors, now + timedelta(seconds=backoff)
+
+    async def _report_failed(
+        self,
+        source: ClaimedSource,
+        error: Exception,
+        cursor_reset: bool,
+        errors: int,
+        next_sync_at: datetime,
+    ) -> None:
+        """Exception text stays out: h11 quotes the raw header value it rejects, a member's pasted
+        credential, and `_raise_for_status` builds its message from the provider's body."""
+        tags = _stream_tags(source)
+        error_class = type(error).__name__
+        with suppress(Exception):
+            match error:
+                case httpx.HTTPStatusError():
+                    request = (
+                        f"{error.response.status_code} {error.request.method} "
+                        f"{error.request.url.copy_with(query=None)}"
+                    )
+                    reason = response_fault(error.response)
+                    fault = f"{request}: {reason}" if reason else request
+                case StreamFault():
+                    fault = error.reason
+                case httpx.ProxyError():
+                    fault = str(error)
+                case ValidationError():
+                    fault = validation_fault(error)
+                case _:
+                    fault = ""
+            log_error(
+                "source_sync.failed",
+                source_id=str(source.source_uid),
+                **tags,
+                account_id=source.account_id,
+                error_class=error_class,
+                provider_fault=fault[:SYNC_PROVIDER_FAULT_MAX_CHARS],
+                consecutive_errors=errors,
+                next_sync_at=next_sync_at.isoformat(),
+                cursor_reset=cursor_reset,
+                stack=formatted_stack(error),
+            )
+        with suppress(Exception):
+            emit_metric(SOURCE_SYNC_FAILED_METRIC, **tags, error_class=error_class)
+        with suppress(Exception):
+            await emit_service_check(
+                SOURCE_SYNC_CHECK,
+                SERVICE_CHECK_CRITICAL,
+                f"{errors} consecutive failed runs, last {error_class}",
+                **_check_tags(source),
+            )
+
+    async def _defer(self, source: ClaimedSource, error: Exception) -> None:
+        next_sync_at = datetime.now(UTC) + timedelta(seconds=SOURCE_SYNC_INTERVAL_SECONDS)
+        with suppress(Exception):
+            warn(
+                "source_sync.deferred",
+                source_id=str(source.source_uid),
+                **_stream_tags(source),
+                account_id=source.account_id,
+                error_class=type(error).__name__,
+                provider_fault="",
+                consecutive_errors=source.consecutive_errors,
+                next_sync_at=next_sync_at.isoformat(),
+                cursor_reset=False,
+            )
+        with suppress(Exception):
+            await self._release(source, False, source.consecutive_errors, next_sync_at)
+
+    async def _release(
+        self, source: ClaimedSource, cursor_reset: bool, errors: int, next_sync_at: datetime
+    ) -> None:
+        cursor, partition_cursor = source.advanced(None if cursor_reset else source.resume)
+        async with workspace_tx() as connection:
+            await connection.execute(
+                sa.update(tables.source)
+                .values(
+                    cursor=cursor,
+                    partition_cursor=partition_cursor,
+                    next_sync_at=_rescheduled(source, next_sync_at),
+                    consecutive_errors=errors,
+                    claimed_by=None,
+                    claim_expires_at=None,
+                    updated_at=sa.func.now(),
+                )
+                .where(
+                    tables.source.c.workspace_id == source.workspace_id,
+                    tables.source.c.uid == source.source_uid,
+                    tables.source.c.claimed_by == source.claim,
+                )
+            )
+
+    async def _skip(self, source: ClaimedSource, reason: str, *, awaits_grant: bool) -> None:
+        """Counts off the stored counter: an unpark (reconnect, resync) zeroes it under a held
+        claim, and a park from the claimed value would discard that."""
+        now = datetime.now(UTC)
+        counted = tables.source.c.consecutive_refusals + 1
+        parks = counted >= SOURCE_REFUSAL_PARK_THRESHOLD
+        held = SOURCE_PARK_HOLD_SECONDS if awaits_grant else SOURCE_PARK_RETRY_SECONDS
+        async with workspace_tx() as connection:
+            row = (
+                await connection.execute(
+                    sa.update(tables.source)
+                    .values(
+                        next_sync_at=_rescheduled(
+                            source,
+                            sa.case(
+                                (parks, now + timedelta(seconds=held)),
+                                else_=now + timedelta(seconds=SOURCE_SYNC_INTERVAL_SECONDS),
+                            ),
+                        ),
+                        consecutive_errors=0,
+                        consecutive_refusals=counted,
+                        parked_at=sa.case((parks, now), else_=None),
+                        parked_reason=sa.case((parks, reason), else_=None),
+                        parked_since=sa.case(
+                            (
+                                parks,
+                                sa.case(
+                                    (
+                                        sa.and_(
+                                            sa.literal(awaits_grant),
+                                            ~tables.source.c.parked_awaits_grant,
+                                        ),
+                                        now,
+                                    ),
+                                    else_=sa.func.coalesce(tables.source.c.parked_since, now),
+                                ),
+                            ),
+                            else_=None,
+                        ),
+                        parked_awaits_grant=sa.case((parks, awaits_grant), else_=False),
+                        claimed_by=None,
+                        claim_expires_at=None,
+                        updated_at=sa.func.now(),
+                    )
+                    .where(
+                        tables.source.c.workspace_id == source.workspace_id,
+                        tables.source.c.uid == source.source_uid,
+                        tables.source.c.claimed_by == source.claim,
+                    )
+                    .returning(tables.source.c.parked_at, tables.source.c.consecutive_refusals)
+                )
+            ).one_or_none()
+        if row is not None and row.parked_at is not None:
+            await self._report_parked(source, reason, row.consecutive_refusals)
+
+    async def _report_parked(self, source: ClaimedSource, reason: str, refusals: int) -> None:
+        tags = _stream_tags(source)
+        with suppress(Exception):
+            warn(
+                "source_sync.parked",
+                source_id=str(source.source_uid),
+                **tags,
+                consecutive_refusals=refusals,
+                reason=reason,
+            )
+        with suppress(Exception):
+            emit_metric(SOURCE_SYNC_PARKED_METRIC, **tags)
+
+
+PAGE_FEED_BATCH_MAX = 50
+
+
+@dataclass(frozen=True)
+class PageChange:
+    """One page's current state as the feed replays it: the source row it belongs to, the provider
+    `stream` and `title` the sync driver landed it under, the inlined body (empty when tombstoned),
+    the content digest, monotonic revision, and `as_of` — the provider's update or creation time,
+    falling back to ingestion time. `created_at == changed_at` marks a page this replay adds rather
+    than updates. `indexed` is the stream's declaration of whether the page reaches memory."""
+
+    page_id: UUID
+    source_id: UUID
+    subject: str
+    stream: str
+    title: str
+    body: str
+    digest: str
+    revision: int
+    tombstone: bool
+    indexed: bool
+    created_at: datetime
+    as_of: datetime
+    changed_at: datetime
+
+
+@dataclass(frozen=True)
+class PageBatch:
+    changes: tuple[PageChange, ...]
+    next_cursor: str | None
+
+
+class PageFeed(Protocol):
+    """The page-substrate seam an indexer reads through `ExtensionContext.pages`: replay every page
+    changed since a `revision|page_id` cursor, bodies inlined, in a bounded batch and total order
+    (`ORDER BY revision, uid`) — dialect-neutral and replay-safe, so a single-owner cursor advances
+    monotonically and a restart resumes where it left off."""
+
+    async def pages_changed_since(self, cursor: str | None, limit: int) -> PageBatch: ...
+
+
+def page_cursor(cursor: object) -> tuple[int, UUID]:
+    if not isinstance(cursor, str):
+        raise ValueError("page cursor must be a string")
+    revision, separator, page_id = cursor.partition("|")
+    if not separator or not revision.isdecimal():
+        raise ValueError(f"invalid page cursor {cursor!r}")
+    try:
+        return int(revision), UUID(page_id)
+    except ValueError as error:
+        raise ValueError(f"invalid page cursor {cursor!r}") from error
+
+
+@dataclass(frozen=True)
+class CorePageFeed:
+    """The core `PageFeed`: reads the bound workspace's `page` rows in `(revision, uid)` order after
+    the cursor and inlines each non-tombstoned body from the blob store, bounding every batch to
+    PAGE_FEED_BATCH_MAX so the inlined bodies stay a small payload. A tombstoned page carries an
+    empty body; its reader drops the page's chunks and mirror on that signal."""
+
+    blob: WorkspaceBlobStore
+
+    async def pages_changed_since(self, cursor: str | None, limit: int) -> PageBatch:
+        query = (
+            sa.select(
+                tables.page.c.uid,
+                tables.page.c.source_uid,
+                tables.page.c.subject,
+                tables.page.c.stream,
+                tables.page.c.title,
+                tables.page.c.body_ref,
+                tables.page.c.digest,
+                tables.page.c.revision,
+                tables.page.c.tombstone,
+                tables.page.c.indexed,
+                tables.page.c.record_created_at,
+                tables.page.c.record_updated_at,
+                tables.page.c.created_at,
+                tables.page.c.updated_at,
+            )
+            .where(tables.page.c.workspace_id == ws_current().workspace_id)
+            .order_by(tables.page.c.revision, tables.page.c.uid)
+            .limit(min(limit, PAGE_FEED_BATCH_MAX))
+        )
+        if cursor is not None:
+            revision, page_id = page_cursor(cursor)
+            query = query.where(
+                sa.or_(
+                    tables.page.c.revision > revision,
+                    sa.and_(
+                        tables.page.c.revision == revision,
+                        tables.page.c.uid > page_id,
+                    ),
+                )
+            )
+        async with workspace_tx() as connection:
+            rows = (await connection.execute(query)).mappings().all()
+        changes: list[PageChange] = []
+        for row in rows:
+            body = "" if row["tombstone"] else (await self.blob.get(row["body_ref"])).decode()
+            record_as_of = row["record_updated_at"] or row["record_created_at"]
+            changes.append(
+                PageChange(
+                    page_id=row["uid"],
+                    source_id=row["source_uid"],
+                    subject=row["subject"],
+                    stream=row["stream"],
+                    title=row["title"],
+                    body=body,
+                    digest=row["digest"],
+                    revision=row["revision"],
+                    tombstone=bool(row["tombstone"]),
+                    indexed=bool(row["indexed"]),
+                    created_at=row["created_at"],
+                    as_of=(
+                        datetime.fromisoformat(record_as_of)
+                        if record_as_of is not None
+                        else row["created_at"]
+                    ),
+                    changed_at=row["updated_at"],
+                )
+            )
+        next_cursor = f"{rows[-1]['revision']}|{rows[-1]['uid']}" if rows else None
+        return PageBatch(changes=tuple(changes), next_cursor=next_cursor)

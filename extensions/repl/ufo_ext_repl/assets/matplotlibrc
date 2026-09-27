@@ -1,0 +1,40 @@
+# Colors: ufo-brand-demo/palette/ufo-palette.json, tokens.light.
+figure.figsize: 8, 4.5
+figure.dpi: 150
+figure.facecolor: white
+figure.constrained_layout.use: True
+savefig.dpi: 300
+savefig.facecolor: white
+font.family: sans-serif
+font.size: 11
+text.color: 0D1418
+axes.facecolor: white
+axes.edgecolor: E1D8C9
+axes.labelcolor: 0D1418
+axes.labelsize: 11
+axes.labelpad: 8
+axes.titlesize: 14
+axes.titleweight: normal
+axes.titlelocation: left
+axes.titlepad: 16
+axes.spines.top: False
+axes.spines.right: False
+axes.linewidth: 0.6
+axes.axisbelow: True
+axes.grid: True
+axes.grid.axis: y
+axes.prop_cycle: cycler('color', ['2E81B6', 'B38550', '025378', '719C76', 'D96667'])
+grid.color: E1D8C9
+grid.linewidth: 0.6
+xtick.color: 454F53
+ytick.color: 454F53
+xtick.labelsize: 10
+ytick.labelsize: 10
+xtick.major.size: 0
+ytick.major.size: 0
+xtick.major.pad: 8
+ytick.major.pad: 8
+lines.linewidth: 2
+lines.markersize: 5
+legend.frameon: False
+legend.fontsize: 10

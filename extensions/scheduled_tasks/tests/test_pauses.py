@@ -1,0 +1,792 @@
+"""The durable workflow pause on the monitor substrate: an extension-owned row, fired by the
+extension's own runner, arbitrated against member ingress by one guarded admission parameter.
+
+Every behavioural contract the `@pause` name-protocol row used to hold is proven here on the new
+substrate, and the arbitration moved rather than changed: the arm no longer asks whether a member
+has spoken (a message landing between that read and the timer would make any answer stale), and the
+fire asks admission under the conversation lock instead. So the two ways one wait can end — the
+member's next message, or the timer — still converge on exactly one resume turn.
+
+The fire drives the real `Admission` (real spend preflight, real turn row, real seq allocation);
+only the DBOS enqueue stands in, recording the workflow id a live queue would receive."""
+
+import json
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
+
+import pytest
+import sqlalchemy as sa
+from ufo_ext_scheduled_tasks.manifest import NAME, manifest
+from ufo_ext_scheduled_tasks.pause_runner import FIRE_KEY_PREFIX, PauseRunner
+from ufo_ext_scheduled_tasks.pauses import Pause, PauseStore, due_pause_workspaces
+from ufo_ext_scheduled_tasks.pauses import pause as pause_table
+from ufo_ext_scheduled_tasks.tools import (
+    PAUSE_DIRECTIVE,
+    SCHEDULED_TASK_KIND,
+    PauseAndWaitInput,
+    pause_and_wait,
+)
+
+from ufo.db import workspace_tx
+from ufo.host.ext.loader import turn_tools
+from ufo.runtime.agent_scope import agent
+from ufo.runtime.engine import FRESH_CLAIM, _claim_turn
+from ufo.runtime.ext.context import ExtensionContext, context_for
+from ufo.runtime.surfaces.admission import Admission, AdmissionInvoker, MemberAdmission
+from ufo.runtime.tools.context import SpawnResult, ToolContext
+from ufo.runtime.tools.registry import ToolDef
+from ufo.runtime.turns.audience import SHARED_AUDIENCE, conversation_audience
+from ufo.runtime.workspace import ws
+from ufo.schema import tables
+from ufo.schema.records import (
+    Agent,
+    ModelAccountCapability,
+    TerminalFrame,
+    Turn,
+    TurnRuntimeConfig,
+)
+
+pytestmark = [
+    pytest.mark.usefixtures("database_url"),
+    pytest.mark.parametrize("database_url", ["sqlite"], indirect=True),
+]
+
+
+@dataclass(frozen=True)
+class _RetireCrashes(PauseStore):
+    """The process dying between the fire's invoke and its retire — the one window where a pause can
+    be re-fired, and the reason the row must survive it still claimed."""
+
+    async def retire(self, row: Pause) -> None:
+        raise RuntimeError("the fire crashed before retiring")
+
+
+@dataclass
+class StubDbos:
+    """Stands in for the DBOS client at the admission seam: enqueue records the workflow id so a
+    test reads back which turns were placed on the queue, never asserting DBOS itself."""
+
+    enqueued: list[str] = field(default_factory=list)
+    failures_remaining: int = 0
+
+    async def enqueue_async(self, options: object, workspace_id: str, turn_id: str) -> None:
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise RuntimeError("enqueue failed")
+        self.enqueued.append(turn_id)
+
+
+async def _unavailable_spawn(
+    profile: str, payload: dict[str, object], background: bool = False
+) -> SpawnResult:
+    raise RuntimeError("spawn is not wired in the pause tests")
+
+
+def _object_tool(name: str) -> ToolDef:
+    tools, _, _ = turn_tools((manifest(),), None, audience=conversation_audience(None))
+    return next(tool for tool in tools if tool.name == name)
+
+
+async def _dispatch(tool: ToolDef, ctx: ToolContext, **args: object) -> str:
+    result = await tool.handler(ctx, tool.input_model.model_validate({**args}))
+    assert result.is_error is False
+    return result.content[0].text
+
+
+async def _seed(surface: str = "cli") -> tuple[UUID, UUID, UUID, UUID]:
+    workspace_id, member_id, agent_id, conversation_id = uuid4(), uuid4(), uuid4(), uuid4()
+    async with workspace_tx() as connection:
+        await connection.execute(
+            sa.insert(tables.workspace).values(
+                id=workspace_id, created_at=sa.func.now(), updated_at=sa.func.now()
+            )
+        )
+        await connection.execute(
+            sa.insert(tables.member).values(
+                id=member_id,
+                workspace_id=workspace_id,
+                email="who@example.com",
+                created_at=sa.func.now(),
+                updated_at=sa.func.now(),
+            )
+        )
+        await connection.execute(
+            sa.insert(tables.agent).values(
+                id=agent_id,
+                workspace_id=workspace_id,
+                name="assistant",
+                prompt="be brief",
+                model="claude-opus-4-8",
+                created_at=sa.func.now(),
+                updated_at=sa.func.now(),
+            )
+        )
+        await connection.execute(
+            sa.insert(tables.conversation).values(
+                id=conversation_id,
+                workspace_id=workspace_id,
+                agent_id=agent_id,
+                surface=surface,
+                queue_key="session",
+                member_id=member_id,
+                created_at=sa.func.now(),
+                updated_at=sa.func.now(),
+            )
+        )
+    return workspace_id, agent_id, conversation_id, member_id
+
+
+async def _second_agent(workspace_id: UUID) -> UUID:
+    agent_id = uuid4()
+    async with workspace_tx() as connection:
+        await connection.execute(
+            sa.insert(tables.agent).values(
+                id=agent_id,
+                workspace_id=workspace_id,
+                name=f"second-{agent_id.hex[:8]}",
+                prompt="be brief",
+                model="claude-opus-4-8",
+                created_at=sa.func.now(),
+                updated_at=sa.func.now(),
+            )
+        )
+    return agent_id
+
+
+def _tool_ctx(
+    workspace_id: UUID,
+    conversation_id: UUID,
+    agent_id: UUID,
+    *,
+    speaker_member_id: UUID | None = None,
+    seq: int = 0,
+) -> ToolContext:
+    return ToolContext(
+        sandbox=None,
+        blob=None,
+        turn=Turn(
+            id=uuid4(),
+            workspace_id=workspace_id,
+            conversation_id=conversation_id,
+            agent_id=agent_id,
+            seq=seq,
+            status="running",
+            inbound="please wait for the approval",
+            created_at=datetime(2026, 8, 14, tzinfo=UTC),
+        ),
+        agent=Agent(prompt="p", model="claude-opus-4-8"),
+        spawn=_unavailable_spawn,
+        speaker_member_id=speaker_member_id,
+        audience=SHARED_AUDIENCE,
+        artifact_token_secret="",
+        ext=context_for(NAME, frozenset()),
+    )
+
+
+def _runner_ctx(invoker: AdmissionInvoker | None) -> ExtensionContext:
+    return context_for(NAME, frozenset(), invoker=invoker)
+
+
+def _invoker(workspace_id: UUID, dbos: StubDbos) -> AdmissionInvoker:
+    return AdmissionInvoker(
+        admission=Admission(dbos=dbos, durable_surfaces=frozenset()), workspace_id=workspace_id
+    )
+
+
+def _wait(**overrides: object) -> PauseAndWaitInput:
+    return PauseAndWaitInput.model_validate(
+        {
+            "ai_response": "I'll wait for the verification email.",
+            "wait_minutes": 10,
+            "next_steps": "Read the code and continue onboarding.",
+            "reason": "verification email",
+            "metadata": {"account": "member@example.com"},
+            **overrides,
+        }
+    )
+
+
+async def _rows(workspace_id: UUID) -> list[sa.RowMapping]:
+    async with workspace_tx() as connection:
+        return list(
+            (
+                await connection.execute(
+                    sa.select(pause_table).where(pause_table.c.workspace_id == workspace_id)
+                )
+            )
+            .mappings()
+            .all()
+        )
+
+
+async def _turns(conversation_id: UUID) -> list[sa.RowMapping]:
+    async with workspace_tx() as connection:
+        return list(
+            (
+                await connection.execute(
+                    sa.select(tables.turn)
+                    .where(tables.turn.c.conversation_id == conversation_id)
+                    .order_by(tables.turn.c.seq)
+                )
+            )
+            .mappings()
+            .all()
+        )
+
+
+async def _arrivals() -> list[str]:
+    async with workspace_tx() as connection:
+        return list(
+            (
+                await connection.execute(
+                    sa.select(tables.inbound_message.c.body).order_by(tables.inbound_message.c.seq)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+async def _due_now(row_id: UUID) -> None:
+    async with workspace_tx() as connection:
+        await connection.execute(
+            sa.update(pause_table)
+            .where(pause_table.c.id == row_id)
+            .values(resume_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+
+
+async def test_pause_arms_a_row_and_returns_the_timer_directive(db: None) -> None:
+    """The arm is unconditional and records what the fire will need: the resume body, the turn
+    sequence to arbitrate from, and its exact capabilities."""
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    armed_at = datetime.now(UTC)
+    with ws(workspace_id), agent(agent_id):
+        result = await pause_and_wait(ctx, _wait())
+        rows = await _rows(workspace_id)
+
+    directive, encoded = result.content[0].text.split("\n", 1)
+    payload = json.loads(encoded)
+    assert directive == PAUSE_DIRECTIVE
+    assert payload["awaiting"] == "timer"
+    assert payload["metadata"] == {"account": "member@example.com"}
+    [row] = rows
+    assert row["conversation_id"] == conversation_id
+    assert row["agent_id"] == agent_id
+    assert row["origin_seq"] == 0
+    assert row["user_description"] == row["prompt"]
+    assert row["claimed_by"] is None
+    assert "Read the code and continue onboarding." in row["prompt"]
+    assert "verification email" in row["prompt"]
+    resume_at = row["resume_at"].replace(tzinfo=UTC)
+    assert timedelta(minutes=9) < resume_at - armed_at < timedelta(minutes=11)
+
+
+@pytest.mark.parametrize("member_bound", [False, True])
+async def test_pause_fires_the_timer_into_a_resumed_turn(db: None, member_bound: bool) -> None:
+    """Tool to timer to resumed turn."""
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(
+        _tool_ctx(workspace_id, conversation_id, agent_id),
+        speaker_member_id=member_id if member_bound else None,
+    )
+    dbos = StubDbos()
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait())
+        [row] = await _rows(workspace_id)
+        await _due_now(row["id"])
+        await PauseRunner(ctx=_runner_ctx(_invoker(workspace_id, dbos))).run()
+        turns = await _turns(conversation_id)
+        remaining = await _rows(workspace_id)
+
+    [turn] = turns
+    assert remaining == []
+    assert turn["inbound"] == row["prompt"]
+    assert not turn["inbound"].startswith("<scheduled_task>")
+    assert turn["admission_source"] == "scheduled"
+    assert turn["speaker_member_id"] is None
+    assert turn["agent_id"] == agent_id
+    assert dbos.enqueued == [str(turn["id"])]
+
+
+async def test_a_member_message_supersedes_the_due_fire(db: None) -> None:
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    dbos = StubDbos()
+    admission = Admission(dbos=dbos, durable_surfaces=frozenset())
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait())
+        [row] = await _rows(workspace_id)
+        member_turn = (
+            await MemberAdmission(admission=admission, workspace_id=workspace_id).admit(
+                conversation_id, "The approval arrived.", "approval-1", speaker_member_id=member_id
+            )
+        ).turn_id
+        await _due_now(row["id"])
+        await PauseRunner(
+            ctx=_runner_ctx(AdmissionInvoker(admission=admission, workspace_id=workspace_id))
+        ).run()
+        turns = await _turns(conversation_id)
+        remaining = await _rows(workspace_id)
+
+    assert remaining == []
+    assert [turn["id"] for turn in turns] == [member_turn]
+    assert turns[0]["admission_source"] == "member"
+    assert dbos.enqueued == [str(member_turn)]
+
+
+async def test_the_pause_arms_even_when_a_member_already_spoke(db: None) -> None:
+    """The arm-time detection is gone, deliberately: a pause armed after a newer member message
+    still writes its row, and the same fire-time guard refuses it."""
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    dbos = StubDbos()
+    admission = Admission(dbos=dbos, durable_surfaces=frozenset())
+    with ws(workspace_id), agent(agent_id):
+        member_turn = (
+            await MemberAdmission(admission=admission, workspace_id=workspace_id).admit(
+                conversation_id, "already spoke", "spoke-first", speaker_member_id=member_id
+            )
+        ).turn_id
+        result = await pause_and_wait(
+            replace(
+                _tool_ctx(workspace_id, conversation_id, agent_id),
+                speaker_member_id=member_id,
+            ),
+            _wait(),
+        )
+        [row] = await _rows(workspace_id)
+        await _due_now(row["id"])
+        await PauseRunner(
+            ctx=_runner_ctx(AdmissionInvoker(admission=admission, workspace_id=workspace_id))
+        ).run()
+        turns = await _turns(conversation_id)
+        remaining = await _rows(workspace_id)
+
+    assert json.loads(result.content[0].text.split("\n", 1)[1])["awaiting"] == "timer"
+    assert remaining == []
+    assert [turn["id"] for turn in turns] == [member_turn]
+
+
+async def test_a_member_message_folds_into_the_fired_turn(db: None) -> None:
+    """The convergence, timer first: the fire founds its turn, and the member's message joins
+    that queued turn as an arrival rather than starting a second one."""
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    dbos = StubDbos()
+    admission = Admission(dbos=dbos, durable_surfaces=frozenset())
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait())
+        [row] = await _rows(workspace_id)
+        await _due_now(row["id"])
+        await PauseRunner(
+            ctx=_runner_ctx(AdmissionInvoker(admission=admission, workspace_id=workspace_id))
+        ).run()
+        [fired] = await _turns(conversation_id)
+        joined = (
+            await MemberAdmission(admission=admission, workspace_id=workspace_id).admit(
+                conversation_id,
+                "The approval arrived.",
+                "approval-after",
+                speaker_member_id=member_id,
+            )
+        ).turn_id
+        turns = await _turns(conversation_id)
+        arrivals = await _arrivals()
+
+    assert joined == fired["id"]
+    assert [turn["id"] for turn in turns] == [fired["id"]]
+    assert arrivals == ["The approval arrived."]
+
+
+async def test_a_crash_between_the_fire_and_the_retire_admits_one_turn(db: None) -> None:
+    """Invoke first, retire second: a crash between the two leaves the row armed and still
+    claimed, so recovery is the lease expiring and the next tick re-claiming it."""
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    dbos = StubDbos()
+    ext = _runner_ctx(_invoker(workspace_id, dbos))
+    runner = PauseRunner(ctx=ext)
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait())
+        [persisted] = await _rows(workspace_id)
+        await _due_now(persisted["id"])
+        [claimed] = await PauseStore(ext).claim_due(datetime.now(UTC), 0)
+        with pytest.raises(RuntimeError, match="crashed"):
+            await runner._fire(_RetireCrashes(ext), claimed)
+        assert len(await _rows(workspace_id)) == 1
+
+        [reclaimed] = await PauseStore(ext).claim_due(datetime.now(UTC), 300)
+        await runner._fire(PauseStore(ext), reclaimed)
+        turns = await _turns(conversation_id)
+        assert await _rows(workspace_id) == []
+
+    [turn] = turns
+    assert turn["idempotency_key"] == f"{FIRE_KEY_PREFIX}{persisted['id']}"
+    assert dbos.enqueued == [str(turn["id"]), str(turn["id"])]
+
+
+async def test_a_failed_enqueue_still_ends_the_wait(db: None) -> None:
+    """An enqueue that failed is not a resume that failed: the turn is durably admitted and the
+    outbox owns getting it onto the queue, so the wait is over and the row retires."""
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    dbos = StubDbos(failures_remaining=1)
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait())
+        [row] = await _rows(workspace_id)
+        await _due_now(row["id"])
+        await PauseRunner(ctx=_runner_ctx(_invoker(workspace_id, dbos))).run()
+        turns = await _turns(conversation_id)
+        remaining = await _rows(workspace_id)
+
+    [turn] = turns
+    assert remaining == []
+    assert turn["status"] == "queued"
+    assert turn["terminal"] is None
+    assert turn["dispatch_enqueued_at"] is None
+    assert dbos.enqueued == []
+
+
+async def test_a_fire_without_an_invoker_fails_loud(db: None) -> None:
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait())
+        [row] = await _rows(workspace_id)
+        await _due_now(row["id"])
+        with pytest.raises(RuntimeError, match="pause fires failed"):
+            await PauseRunner(ctx=_runner_ctx(None)).run()
+
+
+async def test_a_fire_refuses_a_conversation_bound_to_another_agent(db: None) -> None:
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    stranger = await _second_agent(workspace_id)
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait())
+        [row] = await _rows(workspace_id)
+        async with workspace_tx() as connection:
+            await connection.execute(
+                sa.update(pause_table)
+                .where(pause_table.c.id == row["id"])
+                .values(agent_id=stranger, resume_at=datetime.now(UTC) - timedelta(seconds=1))
+            )
+        with pytest.raises(RuntimeError, match="pause fires failed"):
+            await PauseRunner(ctx=_runner_ctx(_invoker(workspace_id, StubDbos()))).run()
+        turns = await _turns(conversation_id)
+        kept = await _rows(workspace_id)
+
+    assert turns == []
+    assert [held["id"] for held in kept] == [row["id"]]
+    assert kept[0]["claimed_by"] is not None
+
+
+async def test_an_unclaimed_pause_cannot_be_retired(db: None) -> None:
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    ext = _runner_ctx(None)
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait())
+        [armed] = await PauseStore(ext).armed(conversation_id)
+        with pytest.raises(ValueError, match="unclaimed pause"):
+            await PauseStore(ext).retire(armed)
+
+
+async def test_only_workspaces_with_a_due_pause_reach_the_runner(db: None) -> None:
+    """A pause whose timer has not come never opens a tick, so a fleet of armed waits costs the
+    dispatcher nothing."""
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait())
+        [row] = await _rows(workspace_id)
+    assert workspace_id not in await due_pause_workspaces()()
+    await _due_now(row["id"])
+    assert workspace_id in await due_pause_workspaces()()
+
+
+async def test_a_spend_breach_cancels_the_resume_and_ends_the_wait(db: None) -> None:
+    """A resume the workspace cannot pay for is refused, not retried: the turn commits cancelled and
+    the row retires, because a client's wait always ends."""
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    spent_turn_id = uuid4()
+    async with workspace_tx() as connection:
+        await connection.execute(
+            sa.insert(tables.turn).values(
+                id=spent_turn_id,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+                agent_id=agent_id,
+                seq=1,
+                status="done",
+                inbound="earlier work",
+                admission_source="internal",
+                terminal=TerminalFrame(status="done").model_dump(mode="json"),
+                created_at=sa.func.now(),
+                updated_at=sa.func.now(),
+            )
+        )
+        await connection.execute(
+            sa.insert(tables.ledger).values(
+                id=uuid4(),
+                workspace_id=workspace_id,
+                turn_id=spent_turn_id,
+                dimension="tokens",
+                amount=10,
+                prompt_tokens=10,
+                input_tokens=10,
+                priced_micro_usd=100,
+                model="claude-opus-4-8",
+                created_at=sa.func.now(),
+                updated_at=sa.func.now(),
+            )
+        )
+        await connection.execute(
+            sa.insert(tables.spend_cap).values(
+                id=uuid4(),
+                workspace_id=workspace_id,
+                scope="workspace",
+                subject_id=None,
+                window_seconds=3600,
+                limit_micro_usd=50,
+                on_breach="reject",
+                created_at=sa.func.now(),
+                updated_at=sa.func.now(),
+            )
+        )
+    dbos = StubDbos()
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait())
+        [row] = await _rows(workspace_id)
+        await _due_now(row["id"])
+        await PauseRunner(ctx=_runner_ctx(_invoker(workspace_id, dbos))).run()
+        turns = await _turns(conversation_id)
+        remaining = await _rows(workspace_id)
+
+    assert remaining == []
+    assert [turn["status"] for turn in turns] == ["done", "cancelled"]
+    assert dbos.enqueued == []
+
+
+async def test_a_fired_resume_claims_like_any_turn(db: None) -> None:
+    """The resumed turn is an ordinary queued turn: the worker claims it, and nothing has to reach
+    back into a pause row to release it — the row was already gone at fire time."""
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait())
+        [row] = await _rows(workspace_id)
+        await _due_now(row["id"])
+        await PauseRunner(ctx=_runner_ctx(_invoker(workspace_id, StubDbos()))).run()
+        [turn] = await _turns(conversation_id)
+        assert await _claim_turn(turn["id"], "timer-resume") == FRESH_CLAIM
+        assert await _rows(workspace_id) == []
+
+
+async def test_pause_rows_never_surface_as_objects(db: None) -> None:
+    """A paused workflow is a thing happening, not a thing a member manages: the pause lives in its
+    own table and reaches no object surface."""
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait())
+        tasks = json.loads(
+            await _dispatch(_object_tool("object_list"), ctx, kind=SCHEDULED_TASK_KIND)
+        )
+        assert len(await _rows(workspace_id)) == 1
+
+    assert tasks["objects"] == []
+
+
+@pytest.mark.parametrize("wait_minutes", (0, 10_081))
+def test_pause_and_wait_bounds_the_timer(wait_minutes: int) -> None:
+    with pytest.raises(ValueError):
+        _wait(wait_minutes=wait_minutes)
+
+
+async def test_a_re_arm_after_an_undelivered_retire_still_resumes(db: None) -> None:
+    """The crash window a stable row id would swallow."""
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    dbos = StubDbos()
+    ext = _runner_ctx(_invoker(workspace_id, dbos))
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait(reason="first wait"))
+        [first] = await _rows(workspace_id)
+        await _due_now(first["id"])
+        await PauseRunner(ctx=ext).run()
+        [fired] = await _turns(conversation_id)
+        assert await _rows(workspace_id) == []
+
+        async with workspace_tx() as connection:
+            await connection.execute(
+                sa.insert(pause_table).values(
+                    **{**dict(first), "claimed_by": None, "claim_expires_at": None}
+                )
+            )
+
+        await pause_and_wait(ctx, _wait(reason="second wait"))
+        [rearmed] = await _rows(workspace_id)
+        await _due_now(rearmed["id"])
+        await PauseRunner(ctx=ext).run()
+        turns = await _turns(conversation_id)
+        remaining = await _rows(workspace_id)
+
+    assert len(turns) == 2
+    assert turns[0]["id"] == fired["id"]
+    assert "second wait" in rearmed["prompt"]
+    assert rearmed["id"] != first["id"]
+    assert remaining == []
+
+
+async def test_the_ordinary_re_arm_after_a_delivered_fire_resumes_twice(db: None) -> None:
+    """The uncrashed path: fire, retire, wait again, fire again — two waits, two resumed turns."""
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    dbos = StubDbos()
+    ext = _runner_ctx(_invoker(workspace_id, dbos))
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait(reason="first wait"))
+        [first] = await _rows(workspace_id)
+        await _due_now(first["id"])
+        await PauseRunner(ctx=ext).run()
+        await pause_and_wait(ctx, _wait(reason="second wait"))
+        [second] = await _rows(workspace_id)
+        await _due_now(second["id"])
+        await PauseRunner(ctx=ext).run()
+        turns = await _turns(conversation_id)
+
+    assert second["id"] != first["id"]
+    assert len(turns) == 2
+    assert len({str(turn["idempotency_key"]) for turn in turns}) == 2
+    assert dbos.enqueued == [str(turns[0]["id"])]
+
+
+async def test_a_member_message_the_live_turn_absorbed_supersedes_the_timer(db: None) -> None:
+    """The fold window, end to end on the pause substrate."""
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    dbos = StubDbos()
+    admission = Admission(dbos=dbos, durable_surfaces=frozenset())
+    invoker = AdmissionInvoker(admission=admission, workspace_id=workspace_id)
+    with ws(workspace_id), agent(agent_id):
+        arming = await invoker.invoke(
+            conversation_id,
+            agent_id,
+            "the arming work",
+            "arming",
+        )
+        [arming_row] = await _turns(conversation_id)
+        base = _tool_ctx(
+            workspace_id,
+            conversation_id,
+            agent_id,
+            speaker_member_id=member_id,
+            seq=arming_row["seq"],
+        )
+        await pause_and_wait(
+            replace(base, turn=base.turn.model_copy(update={"id": arming})), _wait()
+        )
+        [row] = await _rows(workspace_id)
+
+        folded = (
+            await MemberAdmission(admission=admission, workspace_id=workspace_id).admit(
+                conversation_id, "actually, do this instead", "folded", speaker_member_id=member_id
+            )
+        ).turn_id
+        assert folded == arming
+        async with workspace_tx() as connection:
+            await connection.execute(
+                sa.update(tables.inbound_message)
+                .values(consumed_turn_id=arming)
+                .where(tables.inbound_message.c.consumed_turn_id.is_(None))
+            )
+
+        await _due_now(row["id"])
+        await PauseRunner(ctx=_runner_ctx(invoker)).run()
+        turns = await _turns(conversation_id)
+        remaining = await _rows(workspace_id)
+
+    assert [turn["id"] for turn in turns] == [arming]
+    assert remaining == []
+
+
+async def test_a_pause_on_an_archived_app_keeps_its_row_for_the_restore(db: None) -> None:
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    ctx = replace(_tool_ctx(workspace_id, conversation_id, agent_id), speaker_member_id=member_id)
+    dbos = StubDbos()
+    runner_ctx = _runner_ctx(_invoker(workspace_id, dbos))
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait())
+        [row] = await _rows(workspace_id)
+        await _due_now(row["id"])
+        async with workspace_tx() as connection:
+            await connection.execute(
+                sa.update(tables.agent)
+                .values(
+                    name=f"~archived-{agent_id}",
+                    archived_name=tables.agent.c.name,
+                    archived_at=sa.func.now(),
+                )
+                .where(tables.agent.c.id == agent_id)
+            )
+        await PauseRunner(ctx=runner_ctx).run()
+        turns = await _turns(conversation_id)
+        remaining = await _rows(workspace_id)
+        assert dbos.enqueued == []
+
+        async with workspace_tx() as connection:
+            await connection.execute(
+                sa.update(tables.agent)
+                .values(name=tables.agent.c.archived_name, archived_name=None, archived_at=None)
+                .where(tables.agent.c.id == agent_id)
+            )
+            await connection.execute(
+                sa.update(pause_table).values(claimed_by=None, claim_expires_at=None)
+            )
+        assert workspace_id in await due_pause_workspaces()()
+        await PauseRunner(ctx=runner_ctx).run()
+        restored = await _rows(workspace_id)
+        restored_turns = await _turns(conversation_id)
+
+    assert [held["id"] for held in remaining] == [row["id"]]
+    assert turns == []
+    assert restored == []
+    assert len(restored_turns) == 1
+    assert len(dbos.enqueued) == 1
+
+
+async def test_a_pause_resumes_without_member_accounts_under_the_arming_internet_ceiling(
+    db: None,
+) -> None:
+    workspace_id, agent_id, conversation_id, member_id = await _seed()
+    base = _tool_ctx(workspace_id, conversation_id, agent_id, speaker_member_id=member_id)
+    ctx = replace(
+        base,
+        turn=base.turn.model_copy(
+            update={
+                "runtime_config": TurnRuntimeConfig(internet_access=False),
+                "model_accounts": (
+                    ModelAccountCapability(
+                        provider="openai", slot=f"openai_api_key:member:{member_id}"
+                    ),
+                ),
+            }
+        ),
+    )
+    dbos = StubDbos()
+    with ws(workspace_id), agent(agent_id):
+        await pause_and_wait(ctx, _wait())
+        [row] = await _rows(workspace_id)
+        await _due_now(row["id"])
+        await PauseRunner(ctx=_runner_ctx(_invoker(workspace_id, dbos))).run()
+        [turn] = await _turns(conversation_id)
+    assert row["internet_access"] is False
+    assert row["created_by_member_id"] == member_id
+    assert turn["member_id"] == member_id
+    assert TurnRuntimeConfig.model_validate(turn["runtime_config"]) == TurnRuntimeConfig(
+        internet_access=False
+    )
+    assert turn["model_accounts"] == []

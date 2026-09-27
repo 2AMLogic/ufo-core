@@ -1,0 +1,999 @@
+import ast
+import asyncio
+import inspect
+import json
+import shutil
+import subprocess
+import sys
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from uuid import UUID, uuid4
+
+import pytest
+import sqlalchemy as sa
+import ufo_ext_sample.manifest as sample
+from cryptography.fernet import Fernet
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from sqlalchemy.engine import make_url
+from ufo_ext_sample.operator import OPERATOR_RULE as SAMPLE_OPERATOR_RULE
+from ufo_ext_sample.operator import SampleOperatorRule
+from ufo_ext_sample.spend import SampleGate
+
+import ufo.db
+from ufo import serve
+from ufo.blob import FilesystemBlobStore, FleetBlobStore, S3BlobStore, WorkspaceBlobStore
+from ufo.config import (
+    DEFAULT_BACKGROUND_JOBS_MODEL,
+    BlobConfig,
+    Config,
+    DatabaseConfig,
+    DebuggerConfig,
+    OperatorConfig,
+    PackConfig,
+    SandboxConfig,
+    SitesConfig,
+    SourceConfig,
+    SourceEntry,
+)
+from ufo.db import dispose_db, init_db, workspace_tx
+from ufo.harness.auth.bearer import UFO_TOKEN_SECRET_ENV
+from ufo.harness.models.catalog import CORE_MODEL_SPECS, CORE_PRICING
+from ufo.harness.models.registry import ModelRegistry
+from ufo.harness.sandbox.local import LocalCarrier
+from ufo.harness.sandbox.session import EGRESS_CA_CERT_ENV, RunTokenCodec
+from ufo.host.ext.loader import deploy_claims, load_manifests
+from ufo.proxy_serve import OWNER_DSN_ENV, model_rule_base
+from ufo.runtime import queue as loop_queue
+from ufo.runtime.access.credentials import CredentialStore
+from ufo.runtime.access.egress_rules import InjectionRule, ScopeRule
+from ufo.runtime.access.workspace_slots import WorkspaceSlots
+from ufo.runtime.billing.accounting import UNGATED_LEDGER
+from ufo.runtime.billing.spend import GateDeploy
+from ufo.runtime.ext.manifest import CarrierSpec, CredentialSlot, InjectionTarget, Manifest
+from ufo.runtime.ext.operator import install_operator, installed_operator
+from ufo.runtime.ext.surface import SurfaceSpec
+from ufo.runtime.jobs import model_key_slots
+from ufo.runtime.sources.sync import FOLDER_BACKEND
+from ufo.runtime.workspace import SeveralWorkspaces
+from ufo.schema import tables
+
+CA_PEM = "-----BEGIN CERTIFICATE-----\nshared\n-----END CERTIFICATE-----\n"
+ANTHROPIC_KEY = "sk-ant-test"
+CONTROL_TOKEN = "serve-egress-control-secret"
+OWNER_LIBPQ_DSN = "postgresql://ufo_owner:pw@db.test/ufo"
+RUN_TOKENS = RunTokenCodec(b"serve-test-run-token-secret")
+
+
+@pytest.fixture(autouse=True)
+def _run_token_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(UFO_TOKEN_SECRET_ENV, "serve-test-run-token-secret")
+    monkeypatch.delenv("UFO_ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("UFO_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv(serve.RUNTIME_REVISION_ENV, raising=False)
+    monkeypatch.delenv(serve.RUNTIME_IMAGE_ENV, raising=False)
+
+
+class ShutdownProbe:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.stopped = asyncio.Event()
+
+    async def run(self) -> None:
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            self.stopped.set()
+
+
+class FailureProbe:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self) -> None:
+        self.started.set()
+        await self.release.wait()
+        raise RuntimeError("background failed")
+
+
+def _hosted_config() -> Config:
+    return Config(
+        database=DatabaseConfig(url="sqlite+aiosqlite:///ufo.db"),
+        blob=BlobConfig(backend="filesystem", root=Path("/tmp/blobs")),
+        sandbox=SandboxConfig(
+            backend="local", proxy_port=9443, proxy_public_url="https://proxy.test"
+        ),
+    )
+
+
+def _local_config() -> Config:
+    return Config(
+        database=DatabaseConfig(url="sqlite+aiosqlite:///ufo.db"),
+        blob=BlobConfig(backend="filesystem", root=Path("/tmp/blobs")),
+        sandbox=SandboxConfig(backend="local", proxy_port=0),
+    )
+
+
+def _blob() -> FilesystemBlobStore:
+    return FilesystemBlobStore(root=Path("/tmp/blobs"))
+
+
+def test_runtime_identity_of_an_unpackaged_process_carries_no_image() -> None:
+    config = _hosted_config()
+    identity = serve._runtime_identity(config, CarrierSpec(name="local", factory=LocalCarrier))
+
+    assert identity.revision is None
+    assert identity.image_digest is None
+    assert identity.config_digest == serve._payload_digest(config.model_dump(mode="json"))
+    assert identity.sandbox_backend == "local"
+
+
+def test_runtime_identity_binds_deployed_image_config_and_carrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(serve.RUNTIME_REVISION_ENV, "abc12345")
+    monkeypatch.setenv(
+        serve.RUNTIME_IMAGE_ENV,
+        f"registry.test/ufo@sha256:{'a' * 64}",
+    )
+    config = _hosted_config()
+    identity = serve._runtime_identity(
+        config,
+        CarrierSpec(
+            name="local",
+            factory=LocalCarrier,
+            runtime_digest=lambda: f"sha256:{'b' * 64}",
+        ),
+    )
+
+    assert identity is not None
+    assert identity.revision == "abc12345"
+    assert identity.image_digest == f"sha256:{'a' * 64}"
+    assert identity.config_digest == serve._payload_digest(config.model_dump(mode="json"))
+    assert identity.sandbox_backend == "local"
+    assert identity.sandbox_digest == serve._payload_digest(
+        {
+            "config": config.sandbox.model_dump(mode="json"),
+            "carrier": f"sha256:{'b' * 64}",
+        }
+    )
+
+
+def test_runtime_identity_requires_revision_and_image_together(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(serve.RUNTIME_REVISION_ENV, "abc12345")
+
+    with pytest.raises(RuntimeError, match="must be set together"):
+        serve._runtime_identity(_hosted_config(), CarrierSpec(name="local", factory=LocalCarrier))
+
+
+@pytest.mark.parametrize("database_url", ["sqlite"], indirect=True)
+def test_one_shot_closes_the_throwaway_loops_connections(database_url: str, tmp_path: Path) -> None:
+    url = database_url
+    if url.startswith("sqlite"):
+        private = tmp_path / "one_shot.db"
+        shutil.copy(make_url(url).database or "", private)
+        url = f"sqlite+aiosqlite:///{private}"
+    init_db(url)
+    escaped: list[tuple[object, object]] = []
+    try:
+
+        async def touch() -> int:
+            async with workspace_tx() as connection:
+                loop = asyncio.get_running_loop()
+                engine = next(
+                    built for (held, _), built in ufo.db._APP.engines.items() if held is loop
+                )
+                escaped.append((engine, engine.pool))
+                return (await connection.execute(sa.text("select 1"))).scalar_one()
+
+        assert serve._one_shot(touch()) == 1
+        engine, pool_before = escaped[0]
+        assert engine.pool is not pool_before  # type: ignore[attr-defined]
+        assert engine not in ufo.db._APP.engines.values()
+    finally:
+        asyncio.run(dispose_db())
+
+
+@pytest.mark.parametrize("database_url", ["sqlite"], indirect=True)
+def test_serve_verifies_the_owner_database_before_it_seats_the_instance(
+    database_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`hosted.yaml.tpl` TCP-probes serve too."""
+    reachable = database_url
+    if reachable.startswith("sqlite"):
+        private = tmp_path / "serve_boot.db"
+        shutil.copy(make_url(reachable).database or "", private)
+        reachable = f"sqlite+aiosqlite:///{private}"
+
+    def seated(_: object) -> None:
+        raise AssertionError("seated the instance against an unreachable owner database")
+
+    monkeypatch.setenv(OWNER_DSN_ENV, "postgresql://ufo:ufo@127.0.0.1:1/ufo")
+    monkeypatch.setenv("UFO_CREDENTIAL_KEY", Fernet.generate_key().decode())
+    monkeypatch.setattr(serve, "load_config", lambda: _hosted_config())
+    monkeypatch.setattr(serve, "init_o11y", lambda endpoint: None)
+    monkeypatch.setattr(serve, "init_db", lambda opened: init_db(reachable))
+    monkeypatch.setattr(serve, "record_fleet_seat", seated)
+    try:
+        with pytest.raises(ConnectionRefusedError):
+            serve.run(serve.WHOLE_FLEET)
+    finally:
+        asyncio.run(dispose_db())
+
+
+def test_launch_jobs_reuses_the_boot_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    manifests = (Manifest(name="jobs", version="1"),)
+    registry = SimpleNamespace(key_slot_for=lambda _model: None, specs={})
+    page_runner = object()
+    captured: dict[str, object] = {}
+    runtime = SimpleNamespace(
+        config=_local_config(),
+        manifests=manifests,
+        dbos=object(),
+        index=object(),
+        embed=object(),
+        blob=object(),
+        registry=registry,
+        sandboxes=object(),
+        subagents=object(),
+        run_tokens=RunTokenCodec(b"launch-jobs-test-secret"),
+        credentials=None,
+        spend=object(),
+        ledger=object(),
+    )
+
+    def page_change_runner(**kwargs: object) -> object:
+        captured["page"] = kwargs
+        return page_runner
+
+    class Runner:
+        def __init__(self, **kwargs: object) -> None:
+            captured["jobs"] = kwargs
+
+        def launch(self) -> None:
+            captured["launched"] = True
+
+    monkeypatch.setattr(serve, "PageChangeRunner", page_change_runner)
+    monkeypatch.setattr(serve, "core_jobs", lambda *args: ())
+
+    def bindings(*args: object, disabled: frozenset[str]) -> tuple[str]:
+        captured["disabled"] = disabled
+        return ("bindings",)
+
+    monkeypatch.setattr(serve, "bindings_from", bindings)
+    monkeypatch.setattr(serve, "JobRunner", Runner)
+    monkeypatch.setattr(
+        serve, "load_manifests", lambda *args: pytest.fail("manifests loaded twice")
+    )
+    monkeypatch.setattr(
+        serve, "model_registry", lambda *args: pytest.fail("model registry built twice")
+    )
+
+    probes = object()
+    serve._launch_jobs(runtime, object(), object(), object(), probes)
+
+    assert captured["page"]["manifests"] is manifests
+    assert captured["page"]["registry"] is registry
+    assert captured["jobs"]["registry"] is registry
+    assert captured["launched"] is True
+    assert captured["page"]["probes"] is probes
+    assert captured["jobs"]["probes"] is probes
+    assert captured["page"]["spend"] is captured["jobs"]["spend"] is runtime.spend
+    assert captured["page"]["ledger"] is captured["jobs"]["ledger"] is runtime.ledger
+    assert captured["disabled"] == frozenset()
+
+
+def test_launch_jobs_hands_both_runners_the_background_jobs_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both jobs runners carry the configured background-jobs model, so a handler's own metered
+    call runs on it — the boot registry stays the deploy default a member turn resolves through."""
+    registry = SimpleNamespace(key_slot_for=lambda model: None, specs={})
+    captured: dict[str, object] = {}
+    runtime = SimpleNamespace(
+        config=_local_config(),
+        manifests=(Manifest(name="jobs", version="1"),),
+        dbos=object(),
+        index=object(),
+        embed=object(),
+        blob=object(),
+        registry=registry,
+        sandboxes=object(),
+        subagents=object(),
+        run_tokens=RunTokenCodec(b"launch-jobs-test-secret"),
+        credentials=None,
+        spend=object(),
+        ledger=object(),
+    )
+
+    class Runner:
+        def __init__(self, **kwargs: object) -> None:
+            captured["jobs"] = kwargs
+
+        def launch(self) -> None:
+            return None
+
+    def page_change_runner(**kwargs: object) -> object:
+        captured["page"] = kwargs
+        return object()
+
+    monkeypatch.setattr(serve, "PageChangeRunner", page_change_runner)
+    monkeypatch.setattr(serve, "core_jobs", lambda *args: ())
+    monkeypatch.setattr(serve, "bindings_from", lambda *args, disabled: ("bindings",))
+    monkeypatch.setattr(serve, "JobRunner", Runner)
+
+    probes = object()
+    serve._launch_jobs(runtime, object(), object(), object(), probes)
+
+    assert captured["page"]["background_model"] == DEFAULT_BACKGROUND_JOBS_MODEL
+    assert captured["jobs"]["background_model"] == DEFAULT_BACKGROUND_JOBS_MODEL
+    assert captured["jobs"]["registry"] is registry
+    assert captured["page"]["probes"] is probes
+    assert captured["jobs"]["probes"] is probes
+
+
+async def test_serve_lifespan_waits_for_background_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery = ShutdownProbe()
+    reconciler = ShutdownProbe()
+    stranded = ShutdownProbe()
+    poller = ShutdownProbe()
+    speaker = ShutdownProbe()
+    listener = ShutdownProbe()
+    monkeypatch.setattr(serve, "ExecutorRecovery", lambda: recovery)
+    monkeypatch.setattr(serve, "CancelReconciler", lambda client: reconciler)
+    monkeypatch.setattr(serve, "StrandedTurnReconciler", lambda client: stranded)
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            fleet=serve.WHOLE_FLEET,
+            dbos=object(),
+            writeback_poller=poller,
+            mid_turn_reply_poller=speaker,
+            surface_listeners=(listener,),
+            surface_boots=(),
+            configured_sources=(),
+        )
+    )
+    async with serve._serve_lifespan(app):
+        await recovery.started.wait()
+        await reconciler.started.wait()
+        await stranded.started.wait()
+        await poller.started.wait()
+        await speaker.started.wait()
+        await listener.started.wait()
+    assert recovery.stopped.is_set()
+    assert reconciler.stopped.is_set()
+    assert stranded.stopped.is_set()
+    assert poller.stopped.is_set()
+    assert speaker.stopped.is_set()
+    assert listener.stopped.is_set()
+
+
+async def test_the_jobs_fleet_runs_the_reconcilers_and_none_of_the_surface_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The three reconcilers are the whole deploy's safety net, so both fleets run them — a jobs
+    process reclaims a dead turns process's turns and the reverse."""
+    recovery = ShutdownProbe()
+    reconciler = ShutdownProbe()
+    stranded = ShutdownProbe()
+    poller = ShutdownProbe()
+    speaker = ShutdownProbe()
+    listener = ShutdownProbe()
+    monkeypatch.setattr(serve, "ExecutorRecovery", lambda: recovery)
+    monkeypatch.setattr(serve, "CancelReconciler", lambda client: reconciler)
+    monkeypatch.setattr(serve, "StrandedTurnReconciler", lambda client: stranded)
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            fleet=serve.JOBS_FLEET,
+            dbos=object(),
+            writeback_poller=poller,
+            mid_turn_reply_poller=speaker,
+            surface_listeners=(listener,),
+            surface_boots=(),
+            configured_sources=(),
+        )
+    )
+    async with serve._serve_lifespan(app):
+        await recovery.started.wait()
+        await reconciler.started.wait()
+        await stranded.started.wait()
+        await asyncio.sleep(0)
+        assert not poller.started.is_set()
+        assert not speaker.started.is_set()
+        assert not listener.started.is_set()
+
+
+async def test_a_surface_boot_starts_its_work_before_the_first_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The work a surface would otherwise start on its first page — the portal's asset publish —
+    starts with the app loop instead, handed the fleet store it writes through."""
+    monkeypatch.setattr(serve, "ExecutorRecovery", ShutdownProbe)
+    monkeypatch.setattr(serve, "CancelReconciler", lambda client: ShutdownProbe())
+    monkeypatch.setattr(serve, "StrandedTurnReconciler", lambda client: ShutdownProbe())
+    backend = FilesystemBlobStore(root=tmp_path)
+    booted: list[object] = []
+
+    def state(fleet: serve.Fleet) -> SimpleNamespace:
+        return SimpleNamespace(
+            state=SimpleNamespace(
+                fleet=fleet,
+                dbos=object(),
+                writeback_poller=None,
+                mid_turn_reply_poller=None,
+                surface_listeners=(),
+                surface_boots=(booted.append,),
+                blob=WorkspaceBlobStore(backend=backend),
+                configured_sources=(),
+            )
+        )
+
+    async with serve._serve_lifespan(state(serve.WHOLE_FLEET)):
+        pass
+    async with serve._serve_lifespan(state(serve.JOBS_FLEET)):
+        pass
+
+    assert booted == [FleetBlobStore(backend=backend)]
+
+
+async def test_serve_lifespan_propagates_a_background_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery = FailureProbe()
+    reconciler = ShutdownProbe()
+    stranded = ShutdownProbe()
+    monkeypatch.setattr(serve, "ExecutorRecovery", lambda: recovery)
+    monkeypatch.setattr(serve, "CancelReconciler", lambda client: reconciler)
+    monkeypatch.setattr(serve, "StrandedTurnReconciler", lambda client: stranded)
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            fleet=serve.WHOLE_FLEET,
+            dbos=object(),
+            writeback_poller=None,
+            mid_turn_reply_poller=None,
+            surface_listeners=(),
+            surface_boots=(),
+            configured_sources=(),
+        )
+    )
+    with pytest.raises(ExceptionGroup) as raised:
+        async with serve._serve_lifespan(app):
+            await recovery.started.wait()
+            recovery.release.set()
+            await asyncio.wait_for(asyncio.Event().wait(), timeout=1)
+    assert any(
+        isinstance(error, RuntimeError) and str(error) == "background failed"
+        for error in raised.value.exceptions
+    )
+
+
+async def _found_workspace() -> UUID:
+    workspace_id = uuid4()
+    async with workspace_tx() as connection:
+        await connection.execute(
+            sa.insert(tables.workspace).values(
+                id=workspace_id, created_at=sa.func.now(), updated_at=sa.func.now()
+            )
+        )
+    return workspace_id
+
+
+async def test_the_lifespan_registers_configured_sources_into_the_one_workspace(
+    db: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(serve, "ExecutorRecovery", ShutdownProbe)
+    monkeypatch.setattr(serve, "CancelReconciler", lambda client: ShutdownProbe())
+    monkeypatch.setattr(serve, "StrandedTurnReconciler", lambda client: ShutdownProbe())
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            fleet=serve.JOBS_FLEET,
+            dbos=object(),
+            writeback_poller=None,
+            mid_turn_reply_poller=None,
+            surface_listeners=(),
+            surface_boots=(),
+            configured_sources=(
+                SourceEntry(backend=FOLDER_BACKEND, config=SourceConfig(root=str(tmp_path))),
+            ),
+        )
+    )
+    only = await _found_workspace()
+    async with serve._serve_lifespan(app):
+        pass
+    async with workspace_tx() as connection:
+        registered = (
+            (await connection.execute(sa.select(tables.source.c.workspace_id))).scalars().all()
+        )
+    assert registered == [only]
+
+    await _found_workspace()
+    with pytest.raises(SeveralWorkspaces):
+        async with serve._serve_lifespan(app):
+            pass
+
+
+class StubActiveWorkflows:
+    def __init__(self, active: list[str]) -> None:
+        self._active = active
+
+    def activeList(self) -> list[str]:
+        return self._active
+
+
+class StubDbosInstance:
+    def __init__(self, active: list[str]) -> None:
+        self._active_workflows_set = StubActiveWorkflows(active)
+
+
+def test_stop_executor_drains_before_retiring_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    class StubDbos:
+        @classmethod
+        def destroy(cls, *, workflow_completion_timeout_sec: int = 0) -> None:
+            calls.append(("destroy", workflow_completion_timeout_sec))
+
+    class StubHeartbeat:
+        async def retire(self) -> None:
+            calls.append("retire")
+
+    monkeypatch.setattr(serve, "DBOS", StubDbos)
+    serve._stop_executor(StubDbosInstance([]), StubHeartbeat(), 600)
+    assert calls == [("destroy", 600), "retire"]
+
+
+def test_stop_executor_keeps_the_seat_when_workflows_outlive_the_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    class StubDbos:
+        @classmethod
+        def destroy(cls, *, workflow_completion_timeout_sec: int = 0) -> None:
+            calls.append(("destroy", workflow_completion_timeout_sec))
+
+    class StubHeartbeat:
+        async def retire(self) -> None:
+            calls.append("retire")
+
+    monkeypatch.setattr(serve, "DBOS", StubDbos)
+    serve._stop_executor(StubDbosInstance(["wf-live"]), StubHeartbeat(), 600)
+    assert calls == [("destroy", 600)]
+
+
+def test_dbos_destroy_contract_for_the_executor_drain(tmp_path: Path) -> None:
+    probe = Path(__file__).parent / "executor_drain_probe.py"
+    run = subprocess.run(
+        [sys.executable, str(probe), str(tmp_path / "drain_sys.db")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    evidence = json.loads(run.stdout.splitlines()[-1])
+    assert evidence["on_main_thread"] is False
+    assert evidence["active_while_parked"] == 2
+    assert evidence["active_after_main_loop_teardown"] == 2
+    assert evidence["retained_is_stubborn"] is True
+    assert evidence["destroy_seconds"] < 30
+
+
+def test_model_rule_base_prefers_the_ufo_prefixed_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UFO_ANTHROPIC_API_KEY", "sk-ant-ufo-scoped")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", ANTHROPIC_KEY)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    injected = [r for r in model_rule_base(_hosted_config()) if isinstance(r, InjectionRule)]
+    assert [rule.real for rule in injected] == ["sk-ant-ufo-scoped"]
+
+    monkeypatch.setenv("UFO_ANTHROPIC_API_KEY", "")
+    injected = [r for r in model_rule_base(_hosted_config()) if isinstance(r, InjectionRule)]
+    assert [rule.real for rule in injected] == [ANTHROPIC_KEY]
+
+
+def test_model_rule_base_boots_on_the_ufo_prefixed_key_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("UFO_ANTHROPIC_API_KEY", "sk-ant-ufo-scoped")
+    injected = [r for r in model_rule_base(_hosted_config()) if isinstance(r, InjectionRule)]
+    assert [rule.real for rule in injected] == ["sk-ant-ufo-scoped"]
+
+
+def test_proxy_endpoint_is_built_from_config_and_the_shared_ca(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", ANTHROPIC_KEY)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv(EGRESS_CA_CERT_ENV, CA_PEM)
+    monkeypatch.setenv(serve.EGRESS_CONTROL_TOKEN_ENV, CONTROL_TOKEN)
+    app = FastAPI()
+    endpoint = serve._proxy_endpoint(
+        app, _hosted_config(), (), None, CORE_PRICING, RUN_TOKENS, _blob(), None, UNGATED_LEDGER
+    )
+    assert (endpoint.port, endpoint.ca_cert, endpoint.public_url) == (
+        9443,
+        CA_PEM,
+        "https://proxy.test",
+    )
+    mounted = TestClient(app).post("/internal/egress/resolve", json={"proxy_auth": ""})
+    assert mounted.status_code == 401
+
+
+def test_proxy_endpoint_fails_loud_without_the_shared_ca(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(EGRESS_CA_CERT_ENV, raising=False)
+    with pytest.raises(RuntimeError, match=EGRESS_CA_CERT_ENV):
+        serve._proxy_endpoint(
+            FastAPI(),
+            _hosted_config(),
+            (),
+            None,
+            CORE_PRICING,
+            RUN_TOKENS,
+            _blob(),
+            None,
+            UNGATED_LEDGER,
+        )
+
+
+def test_proxy_endpoint_fails_loud_without_the_control_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(EGRESS_CA_CERT_ENV, CA_PEM)
+    monkeypatch.delenv(serve.EGRESS_CONTROL_TOKEN_ENV, raising=False)
+    with pytest.raises(RuntimeError, match=serve.EGRESS_CONTROL_TOKEN_ENV):
+        serve._proxy_endpoint(
+            FastAPI(),
+            _hosted_config(),
+            (),
+            None,
+            CORE_PRICING,
+            RUN_TOKENS,
+            _blob(),
+            None,
+            UNGATED_LEDGER,
+        )
+
+
+def test_proxy_endpoint_fails_loud_when_the_cache_is_on_without_its_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(EGRESS_CA_CERT_ENV, CA_PEM)
+    monkeypatch.setenv(serve.EGRESS_CONTROL_TOKEN_ENV, CONTROL_TOKEN)
+    monkeypatch.delenv(serve.CACHE_CONTROL_TOKEN_ENV, raising=False)
+    config = Config(
+        database=DatabaseConfig(url="sqlite+aiosqlite:///ufo.db"),
+        blob=BlobConfig(backend="filesystem", root=Path("/tmp/blobs")),
+        sandbox=SandboxConfig(
+            backend="local",
+            proxy_port=9443,
+            proxy_public_url="https://proxy.test",
+            cache_daemon="127.0.0.1:9110",
+        ),
+    )
+    with pytest.raises(RuntimeError, match=serve.CACHE_CONTROL_TOKEN_ENV):
+        serve._proxy_endpoint(
+            FastAPI(), config, (), None, CORE_PRICING, RUN_TOKENS, _blob(), None, UNGATED_LEDGER
+        )
+
+
+def test_preview_settings_pair_the_service_with_its_real_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = Config(
+        database=DatabaseConfig(url="sqlite+aiosqlite:///ufo.db"),
+        blob=BlobConfig(backend="filesystem", root=Path("/tmp/blobs")),
+        sandbox=SandboxConfig(
+            backend="local",
+            proxy_port=9443,
+            preview_service="ufo-preview.ufo.svc.cluster.local:8930",
+        ),
+    )
+    monkeypatch.delenv(serve.PREVIEW_TOKEN_ENV, raising=False)
+    with pytest.raises(RuntimeError, match=serve.PREVIEW_TOKEN_ENV):
+        serve._preview_settings(config)
+    monkeypatch.setenv(serve.PREVIEW_TOKEN_ENV, "")
+    with pytest.raises(RuntimeError, match=serve.PREVIEW_TOKEN_ENV):
+        serve._preview_settings(config)
+    monkeypatch.setenv(serve.PREVIEW_TOKEN_ENV, "preview-real")
+    assert serve._preview_settings(config) == (
+        ("ufo-preview.ufo.svc.cluster.local", 8930),
+        "preview-real",
+    )
+
+
+def test_proxy_endpoint_boots_a_local_serve_without_a_shared_ca(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local boot (no `proxy_public_url`) runs no `ufo-egress` unless the dev rig starts one,
+    so `ufoctl serve` alone must come up — the documented zero-services default — not fail loud."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", ANTHROPIC_KEY)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv(EGRESS_CA_CERT_ENV, raising=False)
+    monkeypatch.delenv(serve.EGRESS_CONTROL_TOKEN_ENV, raising=False)
+    app = FastAPI()
+    endpoint = serve._proxy_endpoint(
+        app, _local_config(), (), None, CORE_PRICING, RUN_TOKENS, _blob(), None, UNGATED_LEDGER
+    )
+    assert endpoint.port == 0
+    assert "BEGIN CERTIFICATE" in endpoint.ca_cert
+    mounted = TestClient(app).post("/internal/egress/resolve", json={"proxy_auth": ""})
+    assert mounted.status_code == 401
+
+
+def test_shared_owner_dsn_prefers_the_env_over_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared service opens owner_tx's engine from UFO_OWNER_DSN, whose contract is a plain
+    libpq URL."""
+    monkeypatch.setenv(OWNER_DSN_ENV, OWNER_LIBPQ_DSN)
+    assert serve._shared_owner_dsn(_local_config()) == OWNER_LIBPQ_DSN
+
+
+def test_shared_owner_dsn_falls_back_to_config_owner_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(OWNER_DSN_ENV, raising=False)
+    config = Config(
+        database=DatabaseConfig(url="sqlite+aiosqlite:///ufo.db", owner_url=OWNER_LIBPQ_DSN),
+        blob=BlobConfig(backend="filesystem", root=Path("/tmp/blobs")),
+        sandbox=SandboxConfig(backend="local", proxy_port=0),
+    )
+    assert serve._shared_owner_dsn(config) == OWNER_LIBPQ_DSN
+
+
+def test_shared_owner_dsn_fails_loud_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(OWNER_DSN_ENV, raising=False)
+    with pytest.raises(RuntimeError, match=OWNER_DSN_ENV):
+        serve._shared_owner_dsn(_local_config())
+
+
+def test_the_proxy_resolver_reads_keyed_slots_per_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", ANTHROPIC_KEY)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv(EGRESS_CA_CERT_ENV, CA_PEM)
+    monkeypatch.setenv(serve.EGRESS_CONTROL_TOKEN_ENV, CONTROL_TOKEN)
+    slot = CredentialSlot(
+        name="byok",
+        description="a workspace key the proxy swaps onto the wire",
+        injection=InjectionTarget(host="api.inj.test", header="authorization", sentinel="S"),
+    )
+    manifest = Manifest(name="inj", version="1", credentials=(slot,))
+    captured: dict[str, object] = {}
+
+    def rules(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(resolve=None, turn_live=None, rules_generation=None)
+
+    monkeypatch.setattr(serve, "PerAgentRules", rules)
+    credentials = CredentialStore(fernet=Fernet(Fernet.generate_key()))
+    config = _local_config()
+    serve._proxy_endpoint(
+        FastAPI(),
+        config,
+        (manifest,),
+        credentials,
+        CORE_PRICING,
+        RUN_TOKENS,
+        _blob(),
+        None,
+        UNGATED_LEDGER,
+    )
+    assert captured["credentials"] is credentials
+    claims = deploy_claims((manifest,))
+    assert captured["slots"] == WorkspaceSlots(
+        deploy=(slot,), claimed_slots=claims.slots, claimed_env=claims.env
+    )
+    assert captured["base"] == model_rule_base(config)
+
+
+def test_the_proxy_resolver_base_admits_the_s3_artifact_store_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", ANTHROPIC_KEY)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "serve-test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "serve-test")
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.setenv(EGRESS_CA_CERT_ENV, CA_PEM)
+    monkeypatch.setenv(serve.EGRESS_CONTROL_TOKEN_ENV, CONTROL_TOKEN)
+    captured: dict[str, object] = {}
+
+    def rules(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(resolve=None, turn_live=None, rules_generation=None)
+
+    monkeypatch.setattr(serve, "PerAgentRules", rules)
+    store = S3BlobStore(bucket="ufo-blobs", region="us-east-1")
+
+    serve._proxy_endpoint(
+        FastAPI(), _local_config(), (), None, CORE_PRICING, RUN_TOKENS, store, None, UNGATED_LEDGER
+    )
+
+    assert ScopeRule(allowed_hosts=frozenset({"ufo-blobs.s3.amazonaws.com"})) in captured["base"]
+
+
+def _home_manifest(name: str, home: bool) -> Manifest:
+    async def identify(_request: object, _auth: object) -> None:
+        return None
+
+    return Manifest(
+        name=name,
+        version="0.1.0",
+        surfaces=(SurfaceSpec(name=name, routes=(), identify=identify, home=home),),
+    )
+
+
+def test_the_bare_host_opens_the_surface_that_claims_the_browser_home() -> None:
+    """A browser typing the deploy's host lands on a door, not a 404: `/` redirects to the home
+    surface, which decides between its own page and the sign-in page from the request's session."""
+    app = FastAPI()
+    serve._mount_home(app, (_home_manifest("slack", False), _home_manifest("web", True)))
+
+    landed = TestClient(app).get("/", follow_redirects=False)
+
+    assert landed.status_code == 303
+    assert landed.headers["location"] == "/surface/web"
+
+
+def test_a_deploy_with_no_home_surface_mounts_no_root_route() -> None:
+    app = FastAPI()
+    serve._mount_home(app, (_home_manifest("slack", False),))
+
+    assert TestClient(app).get("/").status_code == 404
+
+
+def test_two_home_surfaces_fail_the_boot() -> None:
+    """Two claims name no single door, so the pack is refused where every other surface conflict
+    is — at boot, rather than by whichever manifest loaded last."""
+    with pytest.raises(RuntimeError, match="browser home"):
+        serve._mount_home(FastAPI(), (_home_manifest("web", True), _home_manifest("debug", True)))
+
+
+def test_reserved_host_prefixes_guard_fails_loud_on_a_gateway_route() -> None:
+
+    def _endpoint(_request: object) -> None: ...
+
+    prefixes = ("/login", "/logout", "/v1/onboard")
+    app = FastAPI()
+    for path in ("/surface/web", "/v1/connect/callback", "/artifacts/{artifact_id}/{filename}"):
+        app.add_route(path, _endpoint)
+    serve._assert_no_reserved_routes(app, prefixes)
+    app.add_route("/v1/onboard/web", _endpoint)
+    serve._assert_no_reserved_routes(app, ())
+    with pytest.raises(RuntimeError, match=r"gateway_prefixes .*/v1/onboard/web"):
+        serve._assert_no_reserved_routes(app, prefixes)
+
+
+def test_serve_refuses_a_page_kit_that_names_no_file_before_it_opens_the_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kit = tmp_path / "page_kit.tar.gz"
+    config = _local_config().model_copy(update={"sites": SitesConfig(page_kit=kit)})
+
+    def opened(url: str) -> None:
+        raise AssertionError(f"opened {url}")
+
+    monkeypatch.setattr(serve, "load_config", lambda: config)
+    monkeypatch.setattr(serve, "init_o11y", lambda endpoint: None)
+    monkeypatch.setattr(serve, "init_db", opened)
+    with pytest.raises(RuntimeError, match=r"\[sites\] page_kit names no file"):
+        serve.run(serve.WHOLE_FLEET)
+    kit.write_bytes(b"kit")
+    with pytest.raises(AssertionError, match="opened"):
+        serve.run(serve.WHOLE_FLEET)
+
+
+def test_serve_installs_the_configured_operator_rule_before_it_opens_the_owner_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    links = DebuggerConfig(turn_urls={"Trace": "https://traces.test/{trace_id}"})
+    base = _local_config().model_copy(
+        update={"pack": PackConfig(name="sample_pack"), "debugger": links}
+    )
+
+    def opened(dsn: str) -> None:
+        raise AssertionError("opened the owner database")
+
+    monkeypatch.setenv(OWNER_DSN_ENV, OWNER_LIBPQ_DSN)
+    monkeypatch.setenv("UFO_CREDENTIAL_KEY", Fernet.generate_key().decode())
+    monkeypatch.setattr(serve, "init_o11y", lambda endpoint: None)
+    monkeypatch.setattr(serve, "init_db", lambda url: None)
+    monkeypatch.setattr(serve, "init_owner_db", opened)
+    monkeypatch.setattr(
+        serve,
+        "load_config",
+        lambda: base.model_copy(update={"operator": OperatorConfig(rule="nobody")}),
+    )
+    with pytest.raises(ValueError, match=r"\[operator\] rule 'nobody' names no registered rule"):
+        serve.run(serve.WHOLE_FLEET)
+    monkeypatch.setattr(
+        serve,
+        "load_config",
+        lambda: base.model_copy(update={"operator": OperatorConfig(rule=SAMPLE_OPERATOR_RULE)}),
+    )
+    try:
+        with pytest.raises(AssertionError, match="opened the owner database"):
+            serve.run(serve.WHOLE_FLEET)
+        setup = installed_operator()
+        assert isinstance(setup.rule, SampleOperatorRule)
+        assert setup.links == links
+    finally:
+        install_operator(None)
+
+
+def test_the_boot_hands_the_sign_in_gateway_and_kit_settings_to_every_consumer() -> None:
+    boot = ast.parse(inspect.getsource(serve.run))
+    calls = {
+        node.func.id: node
+        for tree in (boot, ast.parse(inspect.getsource(loop_queue._run_turn)))
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    passed = {
+        (name, keyword.arg): ast.unparse(keyword.value)
+        for name in ("_mount_shared_surfaces", "TurnEngine")
+        for keyword in calls[name].keywords
+    }
+    state = {
+        ast.unparse(node.targets[0]): ast.unparse(node.value)
+        for node in ast.walk(boot)
+        if isinstance(node, ast.Assign)
+    }
+    assert state["app.state.sign_in_path"] == "config.serve.sign_in_path"
+    assert passed["_mount_shared_surfaces", "sign_in_path"] == "config.serve.sign_in_path"
+    assert passed["_mount_shared_surfaces", "sites"] == "config.sites"
+    assert [ast.unparse(arg) for arg in calls["_assert_no_reserved_routes"].args] == [
+        "app",
+        "config.serve.gateway_prefixes",
+    ]
+    assert passed["TurnEngine", "sign_in_path"] == "runtime.config.serve.sign_in_path"
+    assert passed["TurnEngine", "page_kit"] == "runtime.config.sites.page_kit"
+
+
+def test_the_boot_and_the_mount_share_one_admission_construction() -> None:
+    """`run()` and `_mount_shared_surfaces` each hold an admission, and a fix applied to one used
+    to leave the other — the one bound into the member surface — unchanged."""
+    tree = ast.parse(Path(serve.__file__).read_text())
+    calls = [
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+    assert calls.count("Admission") == 1
+    assert calls.count("_admission") == 2
+    assert "spend" in inspect.signature(serve._admission).parameters
+
+
+def test_boot_builds_each_spend_gate_once_for_the_gates_and_the_ledger() -> None:
+    (manifest,) = (m for m in load_manifests() if m.name == sample.NAME)
+    homed = replace(
+        manifest, surfaces=(replace(manifest.surfaces[0], home=True), *manifest.surfaces[1:])
+    )
+    specs = {spec.id: spec for spec in CORE_MODEL_SPECS}
+    registry = ModelRegistry(specs=specs, pricing=CORE_PRICING, auto_model=next(iter(specs)))
+    spend, ledger = serve.deploy_spend((homed,), registry, "https://ufo.example.com")
+    assert spend.gates == (
+        SampleGate(
+            GateDeploy(
+                public_base_url="https://ufo.example.com", home_surface=manifest.surfaces[0].name
+            )
+        ),
+    )
+    assert ledger.gates is spend.gates
+    assert spend.key_slot_for == registry.key_slot_for
+    assert spend.own_key_slots == model_key_slots(registry)

@@ -1,0 +1,69 @@
+name: preview
+
+on:
+  push:
+    branches: [main]
+    paths: ["servers/preview/**", ".github/workflows/preview.yml"]
+  pull_request:
+    paths: ["servers/preview/**", ".github/workflows/preview.yml"]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: servers/preview
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: servers/preview
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: servers/preview
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f testbed.Dockerfile -t ufo-preview-testbed .
+      - run: |
+          docker run --rm --init -v "$PWD:/crate" -w /crate ufo-preview-testbed \
+            cargo test -- --include-ignored --test-threads=4
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: servers/preview
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t ufo-preview-ci .
+      - run: |
+          docker run --rm -d --name preview-ci -p 18930:8930 \
+            --memory 512m --memory-swap 512m --cpus 1 \
+            -e UFO_PREVIEW_LISTEN=0.0.0.0:8930 -e UFO_PREVIEW_TOKEN=ci \
+            -e UFO_PREVIEW_CONCURRENCY=4 ufo-preview-ci
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:18930/_health && break; sleep 1; done
+          pids=
+          for kind in docx xlsx pptx csv; do
+            curl -fsS -o "/tmp/smoke-$kind.png" -H 'Authorization: Bearer ci' \
+              -F "request={\"kind\":\"$kind\",\"max_width\":800,\"max_height\":800,\"sink\":{\"inline\":true}}" \
+              -F "file=@tests/fixtures/fixture.$kind" http://127.0.0.1:18930/render &
+            pids="$pids $!"
+          done
+          for pid in $pids; do wait "$pid"; done
+          for kind in docx xlsx pptx csv; do file "/tmp/smoke-$kind.png" | grep -q 'PNG image data'; done
+          docker exec preview-ci awk \
+            '$1 == "oom" || $1 == "oom_kill" { if ($2 != 0) exit 1 }' \
+            /sys/fs/cgroup/memory.events
+          docker rm -f preview-ci

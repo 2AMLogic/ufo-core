@@ -1,0 +1,321 @@
+"""Data/security-lane validation (phase #17): the memory data path and the metering→spend-cap
+enforcement chain, exercised end to end against the REAL database and the REAL index / service /
+sync driver / spend evaluator. The only stand-in is the embedding provider — a deterministic
+`EmbedClient` double for the external, paid OpenAI embedding API — and it is never the thing
+asserted: every assertion reads real rows, real recall results, and real spend decisions back from
+the real backend. On the sqlite param this runs against the real DefaultIndex over SQLite FTS5; on
+the postgres param against real Postgres + pgvector."""
+
+from pathlib import Path
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
+
+import pytest
+import sqlalchemy as sa
+from sqlalchemy.ext.asyncio import AsyncConnection
+from ufo_ext_embed_openai import EMBED_DIM
+from ufo_ext_memory.store import (
+    MemoryIndexer,
+    MemoryStore,
+    MemoryWrite,
+    PageIndexer,
+    recall_subjects,
+)
+from ufo_testsupport.index import default_index
+
+from ufo.blob import FilesystemBlobStore
+from ufo.config import SourceConfig, SourceEntry
+from ufo.db import workspace_tx
+from ufo.runtime.billing.accounting import UNGATED_LEDGER, SpendEvaluator
+from ufo.runtime.ext.context import context_for
+from ufo.runtime.ext.source_reader import SourceReader
+from ufo.runtime.indexing import TextChunker
+from ufo.runtime.sources.sync import (
+    FOLDER_BACKEND,
+    CorePageFeed,
+    FolderSource,
+    SyncDriver,
+    register_sources,
+)
+from ufo.runtime.turns.audience import conversation_audience
+from ufo.runtime.turns.subjects import SHARED_SUBJECT, member_subject
+from ufo.runtime.workspace import ws
+from ufo.schema import tables
+from ufo.schema.records import Usage
+
+pytestmark = pytest.mark.integration
+
+HEAVY_USAGE = Usage(
+    input_tokens=1000,
+    output_tokens=2000,
+    cache_read_tokens=3000,
+    cache_write_1h_tokens=4000,
+)
+
+
+class StubEmbed:
+    def __init__(self, axis: int) -> None:
+        vector = [0.0] * EMBED_DIM
+        vector[axis] = 1.0
+        self._vector = tuple(vector)
+
+    async def embed(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        return tuple(self._vector for _ in texts)
+
+
+async def _workspace() -> UUID:
+    workspace_id = uuid4()
+    agent_id = uuid5(NAMESPACE_URL, f"{workspace_id}/main")
+    async with workspace_tx() as connection:
+        await connection.execute(
+            sa.insert(tables.workspace).values(
+                id=workspace_id, created_at=sa.func.now(), updated_at=sa.func.now()
+            )
+        )
+        await connection.execute(
+            sa.insert(tables.agent).values(
+                id=agent_id,
+                workspace_id=workspace_id,
+                name="main",
+                prompt="p",
+                model="m",
+                is_main=True,
+                created_at=sa.func.now(),
+                updated_at=sa.func.now(),
+            )
+        )
+    return workspace_id
+
+
+async def _seed_billable(connection: AsyncConnection) -> tuple[UUID, UUID, UUID, UUID]:
+    """A workspace with a member, an agent, and a conversation — the identities a spend cap scopes
+    to and a metered turn attributes against."""
+    workspace_id, member_id, agent_id, conversation_id = (uuid4() for _ in range(4))
+    await connection.execute(
+        sa.insert(tables.workspace).values(
+            id=workspace_id, created_at=sa.func.now(), updated_at=sa.func.now()
+        )
+    )
+    await connection.execute(
+        sa.insert(tables.member).values(
+            id=member_id,
+            workspace_id=workspace_id,
+            email="a@b.c",
+            created_at=sa.func.now(),
+            updated_at=sa.func.now(),
+        )
+    )
+    await connection.execute(
+        sa.insert(tables.agent).values(
+            id=agent_id,
+            workspace_id=workspace_id,
+            name="assistant",
+            prompt="p",
+            model="claude-opus-4-8",
+            created_at=sa.func.now(),
+            updated_at=sa.func.now(),
+        )
+    )
+    await connection.execute(
+        sa.insert(tables.conversation).values(
+            id=conversation_id,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            surface="cli",
+            queue_key=uuid4().hex,
+            member_id=member_id,
+            created_at=sa.func.now(),
+            updated_at=sa.func.now(),
+        )
+    )
+    return workspace_id, member_id, agent_id, conversation_id
+
+
+async def _seed_running_turn(
+    connection: AsyncConnection,
+    workspace_id: UUID,
+    conversation_id: UUID,
+    agent_id: UUID,
+    speaker_member_id: UUID,
+) -> UUID:
+    turn_id = uuid4()
+    await connection.execute(
+        sa.insert(tables.turn).values(
+            id=turn_id,
+            workspace_id=workspace_id,
+            conversation_id=conversation_id,
+            agent_id=agent_id,
+            seq=1,
+            status="running",
+            inbound="hi",
+            speaker_member_id=speaker_member_id,
+            terminal=None,
+            created_at=sa.func.now(),
+            updated_at=sa.func.now(),
+        )
+    )
+    return turn_id
+
+
+async def _set_member_cap(
+    connection: AsyncConnection,
+    workspace_id: UUID,
+    member_id: UUID,
+    limit_micro_usd: int,
+    on_breach: str,
+) -> None:
+    await connection.execute(
+        sa.insert(tables.spend_cap).values(
+            id=uuid4(),
+            workspace_id=workspace_id,
+            scope="member",
+            subject_id=member_id,
+            window_seconds=3600,
+            limit_micro_usd=limit_micro_usd,
+            on_breach=on_breach,
+            created_at=sa.func.now(),
+            updated_at=sa.func.now(),
+        )
+    )
+
+
+async def _chunk_count() -> int:
+    async with workspace_tx() as connection:
+        return (await connection.execute(sa.text("select count(*) from chunk"))).scalar_one()
+
+
+async def test_folder_source_syncs_indexes_and_is_recalled(
+    db: None, database_url: str, tmp_path: Path
+) -> None:
+    workspace_id = await _workspace()
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "runbook.md").write_text("the incident escalation contact is the on-call captain")
+    embed = StubEmbed(axis=1)
+    index = default_index()
+    blob = FilesystemBlobStore(root=tmp_path / "blobs")
+    memory_context = context_for("memory", frozenset())
+    postgres = database_url.startswith("postgresql")
+    driver = SyncDriver(backends={FOLDER_BACKEND: FolderSource()}, blob=blob, postgres=postgres)
+    page_feed = CorePageFeed(blob=blob)
+    page_indexer = PageIndexer(
+        index=index,
+        embed=embed,
+        transaction=workspace_tx,
+        chunker=TextChunker(),
+        workspace_id=workspace_id,
+        page_states=memory_context.page_states,
+    )
+    service = MemoryStore(
+        index=index,
+        embed=embed,
+        transaction=workspace_tx,
+        workspace_id=workspace_id,
+        page_states=memory_context.page_states,
+        readable_page_states=memory_context.readable_page_states,
+        readable_source_ids=memory_context.readable_source_ids,
+    )
+    with ws(workspace_id):
+        await register_sources(
+            (SourceEntry(backend=FOLDER_BACKEND, config=SourceConfig(root=str(root))),)
+        )
+        await driver.run()
+    async with workspace_tx() as connection:
+        page_count = (
+            await connection.execute(sa.select(sa.func.count()).select_from(tables.page))
+        ).scalar_one()
+    assert page_count == 1
+    assert await _chunk_count() == 0  # embedding is a job, never inline on the sync write
+
+    with ws(workspace_id):
+        await page_indexer.apply((await page_feed.pages_changed_since(None, 50)).changes)
+    assert await _chunk_count() >= 1
+
+    with ws(workspace_id):
+        pages = await service.search_sources(
+            "incident escalation contact",
+            frozenset({SHARED_SUBJECT}),
+            5,
+            source_reader=SourceReader(
+                agent_id=uuid5(NAMESPACE_URL, f"{workspace_id}/main"),
+                requesting_member_id=None,
+                subjects=frozenset({SHARED_SUBJECT}),
+            ),
+        )
+    assert len(pages) == 1
+    assert "on-call captain" in pages[0].text
+
+
+async def test_member_fact_recall_is_isolated_from_other_members(db: None) -> None:
+    """A committed member fact recalls for its owner after indexing but is invisible to another
+    member — the {member, shared} isolation enforced in the real index query, end to end."""
+    workspace_id = await _workspace()
+    alice, bob = uuid4(), uuid4()
+    embed = StubEmbed(axis=2)
+    index = default_index()
+    memory_context = context_for("memory", frozenset())
+    service = MemoryStore(
+        index=index,
+        embed=embed,
+        transaction=workspace_tx,
+        workspace_id=workspace_id,
+        page_states=memory_context.page_states,
+        readable_page_states=memory_context.readable_page_states,
+        readable_source_ids=memory_context.readable_source_ids,
+    )
+    indexer = MemoryIndexer(
+        index=index,
+        embed=embed,
+        transaction=workspace_tx,
+        chunker=TextChunker(),
+        workspace_id=workspace_id,
+        page_states=context_for("memory", frozenset()).page_states,
+    )
+    await service.commit(
+        MemoryWrite(subject=member_subject(alice), body="alice keeps the vault combination")
+    )
+    with ws(workspace_id):
+        await indexer.run()
+        mine = await service.recall(
+            "vault combination",
+            recall_subjects(conversation_audience(alice)),
+            5,
+            source_reader=SourceReader(
+                agent_id=uuid5(NAMESPACE_URL, f"{workspace_id}/main"),
+                requesting_member_id=alice,
+                subjects=recall_subjects(conversation_audience(alice)),
+            ),
+        )
+        assert len(mine) == 1 and "alice" in mine[0].body
+        assert (
+            await service.recall(
+                "vault combination",
+                recall_subjects(conversation_audience(bob)),
+                5,
+                source_reader=SourceReader(
+                    agent_id=uuid5(NAMESPACE_URL, f"{workspace_id}/main"),
+                    requesting_member_id=bob,
+                    subjects=recall_subjects(conversation_audience(bob)),
+                ),
+            )
+            == ()
+        )
+
+
+async def test_metered_sandbox_tokens_breach_a_member_cap_and_park(db: None) -> None:
+    async with workspace_tx() as connection:
+        workspace_id, member_id, agent_id, conversation_id = await _seed_billable(connection)
+        await _set_member_cap(
+            connection, workspace_id, member_id, limit_micro_usd=50, on_breach="park"
+        )
+        evaluator = SpendEvaluator(workspace_id, member_id, agent_id)
+        assert (await evaluator.decide(connection, 0)).outcome == "allow"
+
+        turn_id = await _seed_running_turn(
+            connection, workspace_id, conversation_id, agent_id, speaker_member_id=member_id
+        )
+        await UNGATED_LEDGER.record_sandbox_tokens(
+            connection, workspace_id, turn_id, "claude-opus-4-8", HEAVY_USAGE
+        )
+        decision = await evaluator.decide(connection, 0)
+    assert decision.outcome == "park"
+    assert "parked" in decision.message

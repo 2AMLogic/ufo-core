@@ -1,0 +1,240 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Gating happens per job, never via `on.paths`: a workflow filtered out at the trigger never posts its
+  # required contexts, blocking the PR forever, while a job skipped by `if:` posts skipped.
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      wheel: ${{ github.event_name != 'pull_request' || steps.filter.outputs.wheel == 'true' }}
+      client: ${{ github.event_name != 'pull_request' || steps.filter.outputs.client == 'true' }}
+    steps:
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        if: github.event_name == 'pull_request'
+        id: filter
+        with:
+          filters: |
+            client:
+              - 'client/**'
+              - 'testsupport/**'
+              - '.github/**'
+              - '*'
+            wheel:
+              - 'core/**'
+              - 'extensions/**'
+              - 'packs/**'
+              - 'sandbox/**'
+              - 'testsupport/**'
+              - '.github/**'
+              - '*'
+
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      # `make check` reaches cargo through pre-commit, so the preview clippy hook compiles that crate
+      # and every dependency from scratch.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: servers/preview
+      - uses: actions/cache@v4
+        with:
+          path: .mypy_cache
+          key: mypy-${{ runner.os }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
+          restore-keys: |
+            mypy-${{ runner.os }}-${{ hashFiles('uv.lock') }}-
+            mypy-${{ runner.os }}-
+      - run: uv sync
+      - run: make check
+      - run: uv run pytest --collect-only -m integration -q
+
+  wheel:
+    needs: triage
+    if: needs.triage.outputs.wheel == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.24.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: extensions/debugger/frontend/pnpm-lock.yaml
+      - run: make debugger
+      # The smoke runs from `/tmp`, so every import resolves against the installed wheel and never the
+      # checkout `python -` would otherwise put on the path.
+      - name: Gate production wheel
+        run: |
+          uv build --wheel --all-packages --out-dir /tmp/ufo-wheel
+          unzip -l /tmp/ufo-wheel/ufo-*.whl | grep -q ufo_ext_debugger/static/index.html
+          uv venv --python 3.12 /tmp/ufo-wheel-venv
+          uv export --frozen --no-hashes --no-emit-project --no-dev -o /tmp/ufo-wheel-constraints.txt
+          uv pip install --python /tmp/ufo-wheel-venv/bin/python \
+            -c /tmp/ufo-wheel-constraints.txt /tmp/ufo-wheel/ufo-*.whl
+          /tmp/ufo-wheel-venv/bin/ufoctl --help >/dev/null
+          /tmp/ufo-wheel-venv/bin/python - <<'PY'
+          import os
+          from importlib.metadata import entry_points
+
+          from ufo.harness.agent import AgentDefinition, AgentEngine, Message, ToolDefinition
+          from ufo.harness.context import ContextWindow
+          from ufo.harness.rounds import ModelRoundRunner
+          from ufo.harness.sandbox.protocol import SandboxCommands
+
+          assert AgentDefinition and AgentEngine and Message and ToolDefinition
+          assert ContextWindow and ModelRoundRunner and SandboxCommands
+
+          os.chdir("/tmp")
+
+          for group in ("ufo.extension", "ufo.pack"):
+              entries = entry_points(group=group)
+              assert entries, group
+              for entry in entries:
+                  entry.load()()
+          PY
+
+  sandbox-client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/client-gh
+        with:
+          target: x86_64-unknown-linux-musl
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+      - working-directory: client
+        run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-client
+          path: client/target/release/ufo
+          if-no-files-found: error
+          retention-days: 1
+
+  client:
+    needs: triage
+    if: needs.triage.outputs.client == 'true'
+    uses: ./.github/workflows/client.yml
+    secrets: inherit
+
+  # The shards need the runner's own node — two repl tests drive a real `LocalCarrier` through it —
+  # which `ubuntu-latest` ships.
+  test-shard:
+    name: test shard ${{ matrix.shard }}
+    needs: sandbox-client
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["1/10", "2/10", "3/10", "4/10", "5/10", "6/10", "7/10", "8/10", "9/10", "10/10"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: ufo
+          POSTGRES_PASSWORD: ufo
+          POSTGRES_DB: ufo
+        ports:
+          - 5541:5432
+        options: >-
+          --health-cmd "pg_isready -U ufo"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --no-install-package actionlint-py
+      - uses: actions/download-artifact@v4
+        with:
+          name: sandbox-client
+          path: client/target/release
+      - run: |
+          chmod +x client/target/release/ufo
+          echo "$GITHUB_WORKSPACE/client/target/release" >> "$GITHUB_PATH"
+      - run: UV_NO_SYNC=1 make test SHARD="${{ matrix.shard }}"
+      # Artifact names take no `/`, so the shard is in the index here and spelled in full inside each
+      # `run-summary.json`.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-timings-test-shard-${{ strategy.job-index }}
+          path: .pytest-timings
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+
+  integration:
+    uses: ./.github/workflows/integration.yaml
+
+  # The triage assertion is first and unconditional: a failed triage leaves its outputs empty and every
+  # lane expectation would collapse to skipped. A cancelled gate passes only when GitHub names a newer head.
+  test:
+    if: always()
+    needs: [triage, test-shard, integration, wheel, client]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Require a newer head after cancellation
+        if: ${{ contains(needs.*.result, 'cancelled') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            CURRENT_SHA=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)
+          else
+            CURRENT_SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$GITHUB_REF_NAME" --jq .object.sha)
+          fi
+          test "$CURRENT_SHA" != "$RUN_SHA"
+      - if: ${{ !contains(needs.*.result, 'cancelled') }}
+        run: test "${{ needs.triage.result }}" = success
+      - if: ${{ !contains(needs.*.result, 'cancelled') }}
+        run: test "${{ needs.test-shard.result }}" = success
+      - if: ${{ !contains(needs.*.result, 'cancelled') }}
+        run: test "${{ needs.integration.result }}" = success
+      - if: ${{ !contains(needs.*.result, 'cancelled') }}
+        run: test "${{ needs.wheel.result }}" = "${{ needs.triage.outputs.wheel == 'true' && 'success' || 'skipped' }}"
+      - if: ${{ !contains(needs.*.result, 'cancelled') }}
+        run: test "${{ needs.client.result }}" = "${{ needs.triage.outputs.client == 'true' && 'success' || 'skipped' }}"
+

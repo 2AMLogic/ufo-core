@@ -1,0 +1,161 @@
+name: client
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  version:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require a version bump beside a client change
+        run: |
+          BASE="origin/$GITHUB_BASE_REF"
+          if git diff --quiet "$BASE"...HEAD -- client; then
+            exit 0
+          fi
+          old=$(git show "$(git merge-base "$BASE" HEAD)":client/Cargo.toml | grep '^version = ')
+          new=$(grep '^version = ' client/Cargo.toml)
+          if [ "$old" = "$new" ]; then
+            echo "client/ changed but client/Cargo.toml still says $new — installed clients only update on a version change" >&2
+            exit 1
+          fi
+
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # Benches are excluded: a `harness = false` target takes no libtest arguments, so `--all-targets`
+  # would hand divan's runner flags it rejects.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --profile ci
+      # `annotate_only` keeps the report off the Checks API, which a called workflow cannot reach without
+      # its caller widening the token; `require_tests` fails an empty report rather than looking like a pass.
+      - uses: mikepenz/action-junit-report@v6
+        if: always()
+        with:
+          report_paths: client/target/nextest/ci/junit.xml
+          check_name: client tests
+          detailed_summary: true
+          include_time_in_summary: true
+          annotate_only: true
+          require_tests: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: client-junit
+          path: client/target/nextest/ci/junit.xml
+          retention-days: 14
+      - name: The tests pass with a default gateway compiled in
+        env:
+          UFO_GATEWAY_URL_DEFAULT: http://127.0.0.1:9
+        run: cargo nextest run
+
+  # Without a CodSpeed token that is the whole gate — a bench that stopped compiling fails here —
+  # because wall-clock numbers off a shared runner carry no signal.
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: client
+    env:
+      CODSPEED_TOKEN: ${{ secrets.CODSPEED_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/client-gh
+        with:
+          target: x86_64-unknown-linux-musl
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed
+      - run: cargo codspeed build
+      - if: env.CODSPEED_TOKEN == ''
+        run: cargo codspeed run
+      - if: env.CODSPEED_TOKEN != ''
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: simulation
+          run: cargo codspeed run
+          token: ${{ secrets.CODSPEED_TOKEN }}
+          working-directory: client
+
+  build:
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-14
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/client-gh
+        with:
+          target: ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client
+          key: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ufo-${{ matrix.target }}
+          path: |
+            client/target/${{ matrix.target }}/release/ufo
+            client/target/${{ matrix.target }}/release/ufo.exe
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,88 @@
+import { useEffect, useState } from "react";
+import { FleetListing, get, when } from "./api";
+import { Loading } from "./Loading";
+import { Params } from "./nav";
+
+export function Fleet(props: { navigate: (next: Partial<Params>) => void }) {
+  const [listing, setListing] = useState<FleetListing | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    get<FleetListing>("fleet")
+      .then(setListing)
+      .catch((err: Error) => setError(err.message));
+  }, []);
+
+  if (error) return <div className="empty">{error}</div>;
+  if (listing === null) return <Loading />;
+
+  const open = (workspaceId: string, domain: string | null, conversation: string | null) =>
+    props.navigate({ ws: domain ?? workspaceId, c: conversation, t: null });
+
+  return (
+    <>
+      <h2>Workspaces</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Domain</th>
+            <th>Workspace</th>
+            <th>Members</th>
+            <th>Conversations</th>
+            <th>Last activity</th>
+          </tr>
+        </thead>
+        <tbody>
+          {listing.workspaces.map((workspace) => (
+            <tr
+              key={workspace.workspace_id}
+              className="row"
+              onClick={() => open(workspace.workspace_id, workspace.domain, null)}
+            >
+              <td>{workspace.domain ?? "—"}</td>
+              <td>
+                <code>{workspace.workspace_id}</code>
+              </td>
+              <td>{workspace.members}</td>
+              <td>{workspace.conversations}</td>
+              <td>{when(workspace.last_turn_at)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <h2>Recent threads</h2>
+      {listing.threads.length === 0 ? (
+        <div className="empty">No threads.</div>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th>Domain</th>
+              <th>Surface</th>
+              <th>Thread</th>
+              <th>Turns</th>
+              <th>Last activity</th>
+            </tr>
+          </thead>
+          <tbody>
+            {listing.threads.map((thread) => (
+              <tr
+                key={thread.conversation_id}
+                className="row"
+                onClick={() => open(thread.workspace_id, thread.domain, thread.conversation_id)}
+              >
+                <td>{thread.domain ?? thread.workspace_id}</td>
+                <td>
+                  <span className="chip">{thread.surface}</span>
+                </td>
+                <td>{thread.title ?? <code>{thread.queue_key}</code>}</td>
+                <td>{thread.turn_count}</td>
+                <td>{when(thread.last_turn_at)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </>
+  );
+}

@@ -1,0 +1,43 @@
+"""What the documents pack contributes: document-production skills the agent loads on demand, and
+the `writing` subagent that drafts and edits the prose they carry.
+
+Each skill is a folder under `skills/` — its `SKILL.md` workflow plus the scripts and assets it
+references — that the loader parses into the loadable-skill registry and loads under
+`$UFO_HOME/skills/<name>/`. `office-docx`, `office-pptx`, `pdf`, and `theme-factory` build on
+`design-foundations`, the shared visual baseline, which each names in its
+`depends` so loading any of them pulls it too. `design-foundations` names core's `ufo-style` the
+same way, so an artifact the member gave no style direction for is drawn in the house style
+whichever of these skills owns it. `document-review` reviews any of the office formats, loading
+their skills at runtime to annotate. `writing-drafts` covers the prose a document carries
+rather than its format, so it composes with whichever skill owns the artifact.
+
+`spawn("writing", {"objective": ...})` hands a draft or an edit to a child that already
+holds `writing-drafts` — the pack ships the workflow and the profile that runs on it together."""
+
+from pathlib import Path
+
+from ufo.sdk.manifest import Manifest, SkillSpec
+from ufo_ext_documents.subagent import WRITING_PROFILE
+
+NAME = "documents"
+VERSION = "0.1.0"
+SKILLS_ROOT = Path(__file__).parent / "skills"
+SKILL_NAMES = (
+    "design-foundations",
+    "document-review",
+    "office-docx",
+    "office-pptx",
+    "office-xlsx",
+    "pdf",
+    "theme-factory",
+    "writing-drafts",
+)
+
+
+def manifest() -> Manifest:
+    return Manifest(
+        name=NAME,
+        version=VERSION,
+        subagents=(WRITING_PROFILE,),
+        skills=tuple(SkillSpec(path=SKILLS_ROOT / name) for name in SKILL_NAMES),
+    )

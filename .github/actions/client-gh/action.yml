@@ -1,0 +1,41 @@
+name: Build client gh
+description: Build the gh payload embedded in the terminal client.
+inputs:
+  target:
+    description: Rust release target.
+    required: true
+  client_dir:
+    description: The client crate's directory, relative to the workspace.
+    required: false
+    default: client
+runs:
+  using: composite
+  steps:
+    - id: payload
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/ufo-gh-${{ inputs.target }}.gz
+        key: ufo-gh-${{ inputs.target }}-${{ hashFiles(format('{0}/scripts/build-gh.sh', inputs.client_dir)) }}
+    - uses: actions/setup-go@v6
+      if: steps.payload.outputs.cache-hit != 'true'
+      with:
+        go-version: 1.27.0
+        cache: false
+    - shell: bash
+      env:
+        GODEBUG: http2client=0
+      run: |
+        root="$RUNNER_TEMP"
+        if [ "$RUNNER_OS" = Windows ]; then
+          root=$(cygpath -u "$root")
+        fi
+        archive="$root/ufo-gh-${{ inputs.target }}.gz"
+        if [ "${{ steps.payload.outputs.cache-hit }}" != true ]; then
+          "${{ inputs.client_dir }}/scripts/build-gh.sh" "${{ inputs.target }}" "$archive"
+        fi
+        gzip -t "$archive"
+        value="$archive"
+        if [ "$RUNNER_OS" = Windows ]; then
+          value=$(cygpath -w "$value")
+        fi
+        echo "UFO_GH_ARCHIVE=$value" >> "$GITHUB_ENV"

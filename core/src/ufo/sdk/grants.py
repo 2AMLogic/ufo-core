@@ -1,0 +1,47 @@
+"""Public connection and connector-grant audit views for extension objects.
+
+`ufo.sdk` is a package of thin re-export modules with an empty `__init__.py` (the gate bans
+code in any `__init__.py`), so the public surface lives in named modules like this one."""
+
+from ufo.runtime.access.grants import (
+    ConnectionPermissionDenied as ConnectionPermissionDenied,
+)
+from ufo.runtime.access.grants import (
+    ConnectionRecorded as ConnectionRecorded,
+)
+from ufo.runtime.access.grants import (
+    ConnectionSummary as ConnectionSummary,
+)
+from ufo.runtime.access.grants import (
+    FeedConnection as FeedConnection,
+)
+from ufo.runtime.access.grants import (
+    GrantSummary as GrantSummary,
+)
+from ufo.runtime.access.grants import (
+    ParkedConnection as ParkedConnection,
+)
+from ufo.runtime.access.grants import (
+    account_object_name as account_object_name,
+)
+from ufo.runtime.access.grants import (
+    connection_summaries as connection_summaries,
+)
+from ufo.runtime.access.grants import (
+    feed_connections as feed_connections,
+)
+from ufo.runtime.access.grants import (
+    grant_summaries as grant_summaries,
+)
+from ufo.runtime.access.grants import (
+    parked_breaks as parked_breaks,
+)
+from ufo.runtime.access.grants import (
+    parked_connections as parked_connections,
+)
+from ufo.runtime.access.grants import (
+    provider_label as provider_label,
+)
+from ufo.schema.tables import (
+    MAX_BACKFILL_DAYS as MAX_BACKFILL_DAYS,
+)

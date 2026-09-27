@@ -1,0 +1,501 @@
+use std::path::{Path, PathBuf};
+
+use pulldown_cmark::{Options, Parser};
+
+use crate::admit::Kind;
+use crate::child::{self, ChildError, Limits};
+use crate::config::Config;
+use crate::refusal::Refusal;
+
+const SOFFICE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const SOFFICE_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
+const SOFFICE_CPU_SECS: u64 = 120;
+const FFMPEG_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const FFMPEG_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
+const FFMPEG_CPU_SECS: u64 = 120;
+const VIDEO_THUMBNAIL_FRAMES: u32 = 10;
+const CSV_MAX_ROWS: usize = 200;
+const CSV_MAX_COLS: usize = 50;
+const IMAGE_MAX_DIMENSION_PX: u32 = 8192;
+const IMAGE_MAX_DECODE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Convert `input` to a PDF in `workdir`; a `pdf` input passes through untouched. All parsing
+/// happens inside one bounded soffice child with a per-request profile.
+pub async fn to_pdf(
+    kind: Kind,
+    input: &Path,
+    workdir: &Path,
+    cfg: &Config,
+) -> Result<PathBuf, Refusal> {
+    let source = match kind {
+        Kind::Pdf => return Ok(input.to_path_buf()),
+        Kind::Md => {
+            let text = tokio::fs::read_to_string(input)
+                .await
+                .map_err(|e| Refusal::UnsupportedType(format!("md read: {e}")))?;
+            let html_path = workdir.join("input.html");
+            tokio::fs::write(&html_path, markdown_to_html(&text))
+                .await
+                .map_err(|e| Refusal::RenderTimeout(format!("workdir write: {e}")))?;
+            html_path
+        }
+        Kind::Csv => {
+            let bytes = tokio::fs::read(input)
+                .await
+                .map_err(|e| Refusal::UnsupportedType(format!("csv read: {e}")))?;
+            let html_path = workdir.join("input.html");
+            tokio::fs::write(&html_path, csv_to_html(&bytes))
+                .await
+                .map_err(|e| Refusal::RenderTimeout(format!("workdir write: {e}")))?;
+            html_path
+        }
+        _ => input.to_path_buf(),
+    };
+    let workdir_str = workdir
+        .to_str()
+        .ok_or_else(|| Refusal::UnsupportedType("workdir is not valid utf-8".into()))?;
+    let profile = workdir.join("profile");
+    copy_profile(&cfg.soffice_profile, &profile).await?;
+    let mut cmd = tokio::process::Command::new(&cfg.soffice_bin);
+    cmd.arg("--headless")
+        .arg("--norestore")
+        .arg(format!(
+            "-env:UserInstallation=file://{}",
+            profile.display()
+        ))
+        .arg("--convert-to")
+        .arg("pdf")
+        .arg("--outdir")
+        .arg(workdir)
+        .arg(&source)
+        .current_dir(workdir);
+    let limits = Limits {
+        deadline: cfg.convert_timeout,
+        memory_bytes: Some(SOFFICE_MEMORY_BYTES),
+        file_size_bytes: SOFFICE_FILE_SIZE_BYTES,
+        cpu_secs: SOFFICE_CPU_SECS,
+    };
+    match child::run(cmd, &limits, &[("HOME", workdir_str)]).await {
+        Ok(_) => {}
+        Err(ChildError::Timeout) => {
+            return Err(Refusal::RenderTimeout(format!(
+                "convert exceeded {:?}",
+                cfg.convert_timeout
+            )))
+        }
+        Err(ChildError::Failed(out)) => {
+            return Err(Refusal::UnsupportedType(format!(
+                "soffice: {}",
+                String::from_utf8_lossy(&out.stderr)
+                    .chars()
+                    .take(500)
+                    .collect::<String>()
+            )))
+        }
+        Err(ChildError::Spawn(e)) => {
+            return Err(Refusal::RenderTimeout(format!("soffice spawn: {e}")))
+        }
+    }
+    let pdf = source.with_extension("pdf");
+    let produced = tokio::fs::metadata(&pdf)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false);
+    if !produced {
+        return Err(Refusal::UnsupportedType("soffice produced no pdf".into()));
+    }
+    Ok(pdf)
+}
+
+async fn copy_profile(source: &Path, profile: &Path) -> Result<(), Refusal> {
+    let mut directories = vec![(source.to_path_buf(), profile.to_path_buf())];
+    while let Some((source_dir, profile_dir)) = directories.pop() {
+        tokio::fs::create_dir(&profile_dir)
+            .await
+            .map_err(|e| Refusal::RenderTimeout(format!("soffice profile mkdir: {e}")))?;
+        let mut entries = tokio::fs::read_dir(&source_dir)
+            .await
+            .map_err(|e| Refusal::RenderTimeout(format!("soffice profile read: {e}")))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| Refusal::RenderTimeout(format!("soffice profile entry: {e}")))?
+        {
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|e| Refusal::RenderTimeout(format!("soffice profile type: {e}")))?;
+            let target = profile_dir.join(entry.file_name());
+            if file_type.is_dir() {
+                directories.push((entry.path(), target));
+            } else if file_type.is_file() {
+                tokio::fs::copy(entry.path(), target)
+                    .await
+                    .map_err(|e| Refusal::RenderTimeout(format!("soffice profile copy: {e}")))?;
+            } else {
+                return Err(Refusal::RenderTimeout(
+                    "soffice profile contains a non-file entry".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Renders markdown into a standalone HTML document soffice can load as its conversion source.
+pub fn markdown_to_html(text: &str) -> String {
+    let mut body = String::new();
+    pulldown_cmark::html::push_html(&mut body, Parser::new_ext(text, Options::ENABLE_TABLES));
+    let body = body.replace(
+        "<table>",
+        "<table border=\"1\" cellspacing=\"0\" width=\"100%\">",
+    );
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><style>h1{{font:bold 32pt/120% Arial,Helvetica;margin:0 0 .5em}}h2{{font:bold 24pt/120% Arial,Helvetica;margin:1em 0 .35em}}h3,h4,h5,h6{{font:bold 20pt/120% Arial,Helvetica;margin:1em 0 .35em}}p{{margin:.65em 0}}a{{color:#4dabf7}}code,pre{{font:16pt/140% 'Courier New',monospace}}table{{border-collapse:collapse;border-color:#323535}}th,td{{padding:4px 8px;border-color:#323535;text-align:left;vertical-align:top}}</style></head><body style=\"margin:0;background:#262929;color:#f5f5f5;font:18pt/140% Arial,Helvetica\">{body}</body></html>"
+    )
+}
+
+/// Renders a CSV into a standalone HTML document holding a bordered `<table>` soffice can load —
+/// a controlled parse and grid, not Calc's delimiter-guessing gridless print. The first row is the
+/// header; rendering caps at the first `CSV_MAX_ROWS` rows and `CSV_MAX_COLS` columns, so a huge
+/// CSV is silently but boundedly truncated. The input is bytes, not text: a CSV carries no declared
+/// encoding and an export from Excel is Windows-1252, so a byte that is not UTF-8 is replaced in
+/// its cell and the file still renders.
+pub fn csv_to_html(bytes: &[u8]) -> String {
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .has_headers(false)
+        .from_reader(bytes);
+    let mut rows = String::new();
+    for (r, record) in reader
+        .byte_records()
+        .flatten()
+        .take(CSV_MAX_ROWS)
+        .enumerate()
+    {
+        let cell = if r == 0 { "th" } else { "td" };
+        rows.push_str("<tr>");
+        for field in record.iter().take(CSV_MAX_COLS) {
+            let field = String::from_utf8_lossy(field);
+            rows.push_str(&format!("<{cell}>{}</{cell}>", escape_html(&field)));
+        }
+        rows.push_str("</tr>");
+    }
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><style>@page{{margin: 6mm;}} body{{font-family: sans-serif; margin: 0;}} table{{border-collapse: collapse; width: 100%;}} td,th{{border: 1px solid #999; padding: 4px 8px;}} th{{background: #eee; text-align: left;}}</style></head><body><table border=\"1\" cellspacing=\"0\" width=\"100%\">{rows}</table></body></html>"
+    )
+}
+
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Extract one representative frame from a video into `workdir/out/page-01.png`, scaled to fit the
+/// box while preserving aspect. The frame is the most representative of the first
+/// `VIDEO_THUMBNAIL_FRAMES` frames. ffmpeg runs as one bounded child, its environment cleared but
+/// for a workdir `HOME`.
+pub async fn video_frame(
+    input: &Path,
+    workdir: &Path,
+    max_w: u32,
+    max_h: u32,
+    cfg: &Config,
+) -> Result<(), Refusal> {
+    let out = workdir.join("out");
+    tokio::fs::create_dir_all(&out)
+        .await
+        .map_err(|e| Refusal::RenderTimeout(format!("outdir: {e}")))?;
+    let frame = out.join("page-01.png");
+    let workdir_str = workdir
+        .to_str()
+        .ok_or_else(|| Refusal::UnsupportedType("workdir is not valid utf-8".into()))?;
+    // `thumbnail` buffers its whole frame window at source resolution before the scale runs, so 100
+    // frames of 3840x2160 yuv420p is 1.2 GiB and the child dies with no frame written.
+    let vf = format!(
+        "thumbnail=n={VIDEO_THUMBNAIL_FRAMES},scale='min({max_w},iw)':'min({max_h},ih)':force_original_aspect_ratio=decrease"
+    );
+    let mut cmd = tokio::process::Command::new(&cfg.ffmpeg_bin);
+    cmd.arg("-nostdin")
+        .arg("-y")
+        .arg("-i")
+        .arg(input)
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-vf")
+        .arg(&vf)
+        .arg("-f")
+        .arg("image2")
+        .arg(&frame)
+        .current_dir(workdir);
+    let limits = Limits {
+        deadline: cfg.convert_timeout,
+        memory_bytes: Some(FFMPEG_MEMORY_BYTES),
+        file_size_bytes: FFMPEG_FILE_SIZE_BYTES,
+        cpu_secs: FFMPEG_CPU_SECS,
+    };
+    match child::run(cmd, &limits, &[("HOME", workdir_str)]).await {
+        Ok(_) => {}
+        Err(ChildError::Timeout) => {
+            return Err(Refusal::RenderTimeout(format!(
+                "convert exceeded {:?}",
+                cfg.convert_timeout
+            )))
+        }
+        Err(ChildError::Failed(out)) => {
+            return Err(Refusal::UnsupportedType(format!(
+                "ffmpeg: {}",
+                String::from_utf8_lossy(&out.stderr)
+                    .chars()
+                    .take(500)
+                    .collect::<String>()
+            )))
+        }
+        Err(ChildError::Spawn(e)) => {
+            return Err(Refusal::RenderTimeout(format!("ffmpeg spawn: {e}")))
+        }
+    }
+    let produced = tokio::fs::metadata(&frame)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false);
+    if !produced {
+        return Err(Refusal::UnsupportedType("ffmpeg produced no frame".into()));
+    }
+    Ok(())
+}
+
+/// Redraw a raster image to fit the requested box without enlarging it or losing transparency.
+pub async fn image_cover(
+    input: &Path,
+    workdir: &Path,
+    max_w: u32,
+    max_h: u32,
+) -> Result<(), Refusal> {
+    let out = workdir.join("out");
+    tokio::fs::create_dir_all(&out)
+        .await
+        .map_err(|e| Refusal::RenderTimeout(format!("outdir: {e}")))?;
+    let frame = out.join("page-01.png");
+    let from = input.to_path_buf();
+    tokio::task::spawn_blocking(move || image_cover_sync(&from, &frame, max_w, max_h))
+        .await
+        .map_err(|e| Refusal::RenderTimeout(format!("image join: {e}")))?
+}
+
+fn image_cover_sync(input: &Path, frame: &Path, max_w: u32, max_h: u32) -> Result<(), Refusal> {
+    use image::{ImageDecoder, ImageEncoder};
+    let mut reader = image::ImageReader::open(input)
+        .map_err(|e| Refusal::UnsupportedType(format!("image open: {e}")))?
+        .with_guessed_format()
+        .map_err(|e| Refusal::UnsupportedType(format!("image sniff: {e}")))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(IMAGE_MAX_DIMENSION_PX);
+    limits.max_image_height = Some(IMAGE_MAX_DIMENSION_PX);
+    limits.max_alloc = Some(IMAGE_MAX_DECODE_BYTES);
+    reader.limits(limits);
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| Refusal::UnsupportedType(format!("image decode: {e}")))?;
+    let orientation = decoder
+        .orientation()
+        .map_err(|e| Refusal::UnsupportedType(format!("image orientation: {e}")))?;
+    let mut decoded = image::DynamicImage::from_decoder(decoder)
+        .map_err(|e| Refusal::UnsupportedType(format!("image decode: {e}")))?;
+    decoded.apply_orientation(orientation);
+    let scaled = if decoded.width() > max_w || decoded.height() > max_h {
+        decoded.thumbnail(max_w, max_h)
+    } else {
+        decoded
+    }
+    .into_rgba8();
+    let writer = std::fs::File::create(frame)
+        .map_err(|e| Refusal::RenderTimeout(format!("frame create: {e}")))?;
+    image::codecs::png::PngEncoder::new(writer)
+        .write_image(
+            scaled.as_raw(),
+            scaled.width(),
+            scaled.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| Refusal::RenderTimeout(format!("image encode: {e}")))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn image_cover_keeps_source_size_and_alpha_below_the_box() {
+        let work = tempfile::tempdir().unwrap();
+        let input = work.path().join("input.png");
+        let frame = work.path().join("out/page-01.png");
+        std::fs::create_dir(work.path().join("out")).unwrap();
+        let mut source = image::RgbaImage::new(2, 1);
+        source.put_pixel(0, 0, image::Rgba([255, 0, 0, 0]));
+        source.put_pixel(1, 0, image::Rgba([0, 255, 0, 255]));
+        source.save(&input).unwrap();
+
+        super::image_cover_sync(&input, &frame, 800, 1000).unwrap();
+
+        let cover = image::open(frame).unwrap().into_rgba8();
+        assert_eq!((cover.width(), cover.height()), (2, 1));
+        assert_eq!(cover.get_pixel(0, 0).0, [255, 0, 0, 0]);
+        assert_eq!(cover.get_pixel(1, 0).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn image_cover_scales_down_to_fit_the_box() {
+        let work = tempfile::tempdir().unwrap();
+        let input = work.path().join("input.png");
+        let frame = work.path().join("out/page-01.png");
+        std::fs::create_dir(work.path().join("out")).unwrap();
+        image::RgbaImage::new(4, 2).save(&input).unwrap();
+
+        super::image_cover_sync(&input, &frame, 2, 2).unwrap();
+
+        let cover = image::open(frame).unwrap();
+        assert_eq!((cover.width(), cover.height()), (2, 1));
+    }
+
+    #[test]
+    fn image_cover_refuses_a_source_over_the_dimension_limit() {
+        let work = tempfile::tempdir().unwrap();
+        let input = work.path().join("input.png");
+        let frame = work.path().join("out/page-01.png");
+        std::fs::create_dir(work.path().join("out")).unwrap();
+        image::RgbaImage::new(super::IMAGE_MAX_DIMENSION_PX + 1, 1)
+            .save(&input)
+            .unwrap();
+
+        let error = super::image_cover_sync(&input, &frame, 800, 1000).unwrap_err();
+
+        assert!(matches!(error, crate::refusal::Refusal::UnsupportedType(_)));
+    }
+
+    #[test]
+    fn image_cover_applies_exif_orientation() {
+        let work = tempfile::tempdir().unwrap();
+        let input = work.path().join("input.jpg");
+        let frame = work.path().join("out/page-01.png");
+        std::fs::create_dir(work.path().join("out")).unwrap();
+        image::RgbImage::new(3, 2).save(&input).unwrap();
+        let mut jpeg = std::fs::read(&input).unwrap();
+        jpeg.splice(
+            2..2,
+            [
+                0xff, 0xe1, 0x00, 0x22, b'E', b'x', b'i', b'f', 0, 0, b'M', b'M', 0, 0x2a, 0, 0, 0,
+                8, 0, 1, 1, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0,
+            ],
+        );
+        std::fs::write(&input, jpeg).unwrap();
+
+        super::image_cover_sync(&input, &frame, 800, 1000).unwrap();
+
+        let cover = image::open(frame).unwrap();
+        assert_eq!((cover.width(), cover.height()), (2, 3));
+    }
+
+    #[tokio::test]
+    async fn initialized_profile_tree_is_copied() {
+        let source = tempfile::tempdir().unwrap();
+        let buildid = source.path().join("user/extensions/buildid");
+        tokio::fs::create_dir_all(buildid.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&buildid, b"build-id").await.unwrap();
+        tokio::fs::write(
+            source.path().join("user/registrymodifications.xcu"),
+            b"<prop oor:name=\"ooSetupLastVersion\"/>",
+        )
+        .await
+        .unwrap();
+        let profile_root = tempfile::tempdir().unwrap();
+        let profile = profile_root.path().join("profile");
+        super::copy_profile(source.path(), &profile).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(profile.join("user/extensions/buildid"))
+                .await
+                .unwrap(),
+            b"build-id"
+        );
+        assert!(
+            tokio::fs::read_to_string(profile.join("user/registrymodifications.xcu"))
+                .await
+                .unwrap()
+                .contains("ooSetupLastVersion")
+        );
+    }
+
+    #[test]
+    fn markdown_becomes_html_document() {
+        let html = super::markdown_to_html("# Title\n\nbody **bold**\n");
+        assert!(html.contains("<h1>Title</h1>"));
+        assert!(html.contains("<strong>bold</strong>"));
+        assert!(html.starts_with("<!doctype html>"));
+    }
+
+    #[test]
+    fn markdown_uses_the_portal_dark_page_and_reading_size() {
+        let html = super::markdown_to_html("# Title\n\nbody `code`\n");
+        assert!(html.contains("background:#262929;color:#f5f5f5"));
+        assert!(html.contains("font:18pt/140% Arial,Helvetica"));
+        assert!(html.contains("h1{font:bold 32pt/120% Arial,Helvetica"));
+        assert!(html.contains("code,pre{font:16pt/140% 'Courier New',monospace"));
+    }
+
+    #[test]
+    fn markdown_table_becomes_an_html_table() {
+        let html = super::markdown_to_html(
+            "| Name | City |\n| --- | --- |\n| Alice | Boston |\n| Bob | Reno |\n",
+        );
+        assert!(html.contains("<table"));
+        assert!(html.contains("<th>Name</th>"));
+        assert!(html.contains("<th>City</th>"));
+        assert!(html.contains("<td>Alice</td>"));
+        assert!(html.contains("<td>Reno</td>"));
+        assert!(html.contains("<table border=\"1\" cellspacing=\"0\" width=\"100%\">"));
+    }
+
+    #[test]
+    fn csv_becomes_a_bordered_table_with_a_header_row() {
+        let html = super::csv_to_html(b"name,city\nAlice,Boston\nBob,Reno\n");
+        assert!(html.contains("<table"));
+        assert!(html.contains("border-collapse: collapse"));
+        assert!(html.contains("<th>name</th>"));
+        assert!(html.contains("<th>city</th>"));
+        assert!(html.contains("<td>Alice</td>"));
+        assert!(html.contains("<td>Bob</td>"));
+    }
+
+    #[test]
+    fn csv_cells_are_html_escaped() {
+        let html = super::csv_to_html(b"expr\na<b & c\n");
+        assert!(html.contains("<td>a&lt;b &amp; c</td>"));
+        assert!(!html.contains("<td>a<b & c</td>"));
+    }
+
+    #[test]
+    fn csv_quoted_field_keeps_its_embedded_comma_in_one_cell() {
+        let html = super::csv_to_html(b"a,b\n\"x,y\",z\n");
+        assert!(html.contains("<td>x,y</td>"));
+        assert!(html.contains("<td>z</td>"));
+    }
+
+    #[test]
+    fn csv_bytes_outside_utf8_still_render_their_rows() {
+        let html = super::csv_to_html(b"name,city\nJos\xe9,Gen\xe8ve\n");
+        assert!(html.contains("<th>name</th>"));
+        assert!(html.contains("<td>Jos\u{fffd}</td>"));
+        assert!(html.contains("<td>Gen\u{fffd}ve</td>"));
+    }
+}

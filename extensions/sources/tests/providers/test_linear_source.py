@@ -1,0 +1,267 @@
+"""The Linear connector over a mock transport: the GraphQL `POST /graphql` shape — one query per
+page, `pageInfo.endCursor` threaded into the next request's `after`, `hasNextPage` ending the walk —
+the incremental `filter: { updatedAt: { gte } }` gate, a full-refresh stream (no `updatedAt` filter)
+threading no variables, the `render` override that lifts an issue/project into readable prose and
+titles a titleless comment off its body, the two rendered content streams naming only the fields the
+connector reads, a 403 surfacing as
+`StreamSkipped`, and a GraphQL `errors` array failing loud. No conftest: the shared
+`ufo_testsupport` plugin covers fixtures, and these tests are offline (a canned transport, no
+DB, no token, no broker)."""
+
+import json
+import re
+from collections.abc import Callable
+from dataclasses import dataclass
+from uuid import UUID, uuid4
+
+import httpx
+import pytest
+from ufo_ext_sources.providers.linear import (
+    COMMENTS_QUERY,
+    ISSUES_QUERY,
+    LinearConnector,
+)
+
+from ufo.runtime.access.connectors import Credential
+from ufo.runtime.sources.sync import SourceAuth, StreamFault, StreamSkipped, SyncResult
+from ufo.sdk.sources import ConnectorBackend, ConnectorSourceConfig
+
+
+@dataclass(frozen=True)
+class _MockProxy:
+    handler: Callable[[httpx.Request], httpx.Response]
+
+    async def credential(self, workspace_id: UUID, provider: str) -> Credential:
+        return Credential(transport=httpx.MockTransport(self.handler))
+
+
+async def _fetch(
+    stream: str,
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    cursor: str | None = None,
+) -> SyncResult:
+    auth = SourceAuth(workspace_id=uuid4(), auth_proxy=_MockProxy(handler=handler))
+    return await ConnectorBackend(connector=LinearConnector()).fetch(
+        ConnectorSourceConfig(stream=stream), cursor, auth
+    )
+
+
+def _refs(result: SyncResult) -> set[str]:
+    return {page.source_ref for page in result.pages}
+
+
+def _node_fields(query: str) -> set[str]:
+    """The field names one page's `nodes` selection asks for, each nested selection collapsed onto
+    the field that carries it."""
+    selection = query.split("nodes {", 1)[1].rsplit("pageInfo", 1)[0]
+    while re.search(r"\{[^{}]*\}", selection):
+        selection = re.sub(r"\{[^{}]*\}", " ", selection)
+    return {token for token in selection.split() if token != "}"}
+
+
+def test_the_rendered_streams_ask_only_for_the_fields_the_connector_reads() -> None:
+    assert _node_fields(ISSUES_QUERY) == {
+        "id",
+        "identifier",
+        "title",
+        "description",
+        "priorityLabel",
+        "state",
+        "assignee",
+        "createdAt",
+        "updatedAt",
+    }
+    assert _node_fields(COMMENTS_QUERY) == {"id", "body", "createdAt", "updatedAt"}
+
+
+def _issue(issue_id: str, title: str, updated: str) -> dict[str, object]:
+    return {
+        "id": issue_id,
+        "identifier": f"ENG-{issue_id}",
+        "title": title,
+        "description": f"Do the {title} work",
+        "state": {"id": "s1", "type": "started"},
+        "priorityLabel": "High",
+        "assignee": {"id": "u1"},
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "updatedAt": updated,
+    }
+
+
+def _issues_handler(
+    bodies: list[dict[str, object]],
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "api.linear.app"
+        assert request.method == "POST" and request.url.path == "/graphql"
+        body = json.loads(request.content)
+        bodies.append(body)
+        variables = body.get("variables") or {}
+        if variables.get("after") == "c2":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "issues": {
+                            "nodes": [_issue("i2", "Second", "2026-02-05T00:00:00.000Z")],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "issues": {
+                        "nodes": [_issue("i1", "First", "2026-02-01T00:00:00.000Z")],
+                        "pageInfo": {"hasNextPage": True, "endCursor": "c2"},
+                    }
+                }
+            },
+        )
+
+    return handle
+
+
+async def test_issues_paginate_over_pageinfo_and_render_lifts_readable_body() -> None:
+    bodies: list[dict[str, object]] = []
+    result = await _fetch("issues", _issues_handler(bodies))
+
+    assert _refs(result) == {"issues/i1", "issues/i2"}
+    assert result.snapshot is False
+    assert result.deletes == ()
+    assert result.next_cursor == "2026-02-05T00:00:00.000Z"
+    assert any((body.get("variables") or {}).get("after") == "c2" for body in bodies)
+
+    page = next(page for page in result.pages if page.source_ref == "issues/i1")
+    assert page.created_at == "2026-01-01T00:00:00.000000+00:00"
+    assert page.updated_at == "2026-02-01T00:00:00.000000+00:00"
+    body = page.body
+    assert "First" in body
+    assert "Do the First work" in body
+    assert "started" in body
+    assert "High" in body
+    assert "pageInfo" not in body
+    assert "nodes" not in body
+
+
+async def test_full_refresh_stream_upserts_without_a_snapshot() -> None:
+    """A collection with no `updatedAt` filter (issue_relations) full-refreshes each run:
+    snapshot=False, no cursor advanced, and no `filter`/`orderBy` variables threaded."""
+    bodies: list[dict[str, object]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "issueRelations": {
+                        "nodes": [
+                            {
+                                "id": "r1",
+                                "type": "blocks",
+                                "issue": {"id": "i1"},
+                                "relatedIssue": {"id": "i2"},
+                            }
+                        ],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            },
+        )
+
+    result = await _fetch("issue_relations", handle)
+    assert result.snapshot is False
+    assert result.next_cursor is None
+    assert result.deletes == ()
+    assert _refs(result) == {"issue_relations/r1"}
+    assert "variables" not in bodies[0]
+
+
+async def test_forbidden_status_raises_stream_skipped() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"errors": [{"message": "forbidden"}]})
+
+    with pytest.raises(StreamSkipped, match="refused"):
+        await _fetch("issues", handle)
+
+
+async def test_graphql_errors_fail_loud() -> None:
+    """A GraphQL `errors` array (a 200 the query engine rejected) fails loud rather than commit a
+    partial page — the run surfaces the fault instead of silently syncing nothing."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"errors": [{"message": "Field 'bogus' doesn't exist on type 'Issue'"}]}
+        )
+
+    with pytest.raises(RuntimeError, match="graphql error"):
+        await _fetch("issues", handle)
+
+
+async def test_graphql_errors_name_their_message_and_code_in_the_stream_fault() -> None:
+    """The fault reaches the failure event as its `provider_fault`, so it carries each error's
+    message and code and nothing else the entry echoes back."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "errors": [
+                    {
+                        "message": "Cannot query field 'bogus' on type 'Customer'",
+                        "locations": [{"line": 1, "column": 42}],
+                        "extensions": {"code": "GRAPHQL_VALIDATION_FAILED", "echo": "SUPERSECRET"},
+                    }
+                ]
+            },
+        )
+
+    with pytest.raises(StreamFault) as raised:
+        await _fetch("customers", handle)
+    assert raised.value.reason == (
+        "linear: graphql error on 'customers': "
+        "Cannot query field 'bogus' on type 'Customer' [GRAPHQL_VALIDATION_FAILED]"
+    )
+
+
+async def test_comments_land_with_a_title_taken_off_the_body() -> None:
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "comments": {
+                        "nodes": [
+                            {
+                                "id": "cm1",
+                                "body": "Looks good to me\nship it",
+                                "createdAt": "2026-02-01T00:00:00.000Z",
+                                "updatedAt": "2026-02-02T00:00:00.000Z",
+                            },
+                            {
+                                "id": "cm2",
+                                "body": "",
+                                "createdAt": "2026-02-01T00:00:00.000Z",
+                                "updatedAt": "2026-02-03T00:00:00.000Z",
+                            },
+                        ],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            },
+        )
+
+    result = await _fetch("comments", handle)
+
+    assert _refs(result) == {"comments/cm1", "comments/cm2"}
+    assert result.dropped == 0
+    titles = {page.source_ref: page.title for page in result.pages}
+    assert titles == {"comments/cm1": "Looks good to me", "comments/cm2": "comments/cm2"}
+    body = next(page.body for page in result.pages if page.source_ref == "comments/cm1")
+    assert "Looks good to me\nship it" in body
+    assert result.next_cursor == "2026-02-03T00:00:00.000Z"
