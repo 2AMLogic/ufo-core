@@ -273,11 +273,10 @@ class MemoryUpdateInput(BaseModel):
     deprecates: tuple[Annotated[str, Field(min_length=1, max_length=NAME_MAX_CHARS)], ...] = Field(
         default=(),
         max_length=NAMES_MAX,
-        description="Names or claims copied verbatim from `body` that this correction makes out "
-        "of date. Choose text that also appears in the older memory. For example, if an older "
-        "item says 'homepage remains unusable', state that claim is out of date in `body` and "
-        "set `deprecates` to ['homepage remains unusable']. Empty only when no earlier memory "
-        "is contradicted.",
+        description="Names or claims copied verbatim from older memory that this correction "
+        "makes out of date. Choose text that also appears in the older memory. For example, "
+        "if an older item says 'homepage remains unusable', set `deprecates` to "
+        "['homepage remains unusable']. Empty only when no earlier memory is contradicted.",
     )
 
 
@@ -690,7 +689,7 @@ async def memory_update_handler(ctx: ToolContext, args: MemoryUpdateInput) -> To
     subject = str(ctx.effective_audience)
     store = store_for(ctx.ext)
     if args.deprecates:
-        await admit(store, subject, args.body, args.deprecates)
+        await admit(store, subject, args.deprecates)
     item = await store.commit(
         MemoryWrite(
             subject=subject,
@@ -1157,9 +1156,9 @@ def manifest() -> Manifest:
                     "system the values it reports about itself and can read again on demand — a "
                     "last-updated time, a count, an identifier, a status flag. When an item you "
                     "recalled contradicts what a live source just told you, record the corrected "
-                    "statement with `deprecates` naming the old subject or claim. Include that "
-                    "name in `body` too, so the old memory is marked out of date. If the tool "
-                    "rejects the name, retry with `deprecates` still set. Set `memory_kind` "
+                    "statement with `deprecates` naming the old subject or claim from older "
+                    "memory. If the tool rejects a name, retry with `deprecates` still set. Set "
+                    "`memory_kind` "
                     "(fact/preference/decision/event/task) so recency decay matches how fast the "
                     "item goes stale, and `confidence` (1-10) for how sure you are it is true. "
                     "A one-off instruction ('make it shorter') belongs in the turn, in-task "

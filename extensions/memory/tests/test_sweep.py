@@ -232,17 +232,32 @@ async def test_a_private_correction_stays_in_its_own_audience(db: None) -> None:
     assert own_pointer == y
 
 
-async def test_admission_refuses_a_name_the_row_does_not_carry_or_names_too_much(db: None) -> None:
+async def test_admission_accepts_a_name_outside_the_body_and_limits_its_reach(db: None) -> None:
     workspace_id = await _workspace()
     with ws(workspace_id):
         store = _store()
         await _commit(store, f"{ARCHIVED} — Default branch is main.", JULY)
         await _commit(store, f"PR 1839 — Merged into {ARCHIVED}.", JULY, "event")
-        with pytest.raises(ValueError, match="No memory was saved") as missing:
-            await admit(store, SHARED_SUBJECT, DEPRECATION, ("ufo-ai/ufo",))
         with pytest.raises(ValueError, match="matches 2 rows") as broad:
-            await admit(store, SHARED_SUBJECT, DEPRECATION, (ARCHIVED,), ceiling=1)
-        admitted = await admit(store, SHARED_SUBJECT, DEPRECATION, (ARCHIVED,))
+            await admit(store, SHARED_SUBJECT, (ARCHIVED,), ceiling=1)
+        admitted = await admit(store, SHARED_SUBJECT, (ARCHIVED,))
     assert admitted == frozenset({SHARED_SUBJECT})
-    assert "keep it in `deprecates`" in str(missing.value)
-    assert "narrower name in both `body` and `deprecates`" in str(broad.value)
+    assert "narrower name in `deprecates`" in str(broad.value)
+
+
+async def test_a_declaration_replaces_old_memory_without_repeating_its_name(db: None) -> None:
+    workspace_id = await _workspace()
+    with ws(workspace_id):
+        store = _store()
+        old = await _commit(store, "The homepage remains unusable.", JULY)
+        names = ("homepage remains unusable",)
+        await admit(store, SHARED_SUBJECT, names)
+        correction = await _commit(
+            store,
+            "The homepage now returns 200 with full content.",
+            SEPTEMBER,
+            deprecates=names,
+        )
+        await Sweep(store=store).run()
+        overtaken = await _overtaken_by(old)
+    assert overtaken == correction

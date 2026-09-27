@@ -376,19 +376,16 @@ async def test_memory_update_names_the_item_it_wrote(db: None, tmp_path: Path) -
     assert MEMORY_TOOLS["memory_update"].activity == memory.MEMORY_UPDATE_ACTIVITY
 
 
-async def test_memory_update_refuses_a_deprecated_name_the_row_does_not_carry(
+async def test_memory_update_accepts_a_deprecated_name_outside_the_body(
     db: None, tmp_path: Path
 ) -> None:
     workspace_id = await _workspace()
     with ws(workspace_id):
         ext = _ext(default_index(), StubEmbed(vec((0, 1.0))))
         ctx = _tool_ctx(ext, None, tmp_path, workspace_id=workspace_id)
-        with pytest.raises(ValueError, match="No memory was saved") as error:
-            await _run("memory_update", ctx, body=DEPRECATION, deprecates=["ufo-ai/ufo"])
-        bodies = await _live_bodies(SHARED_SUBJECT)
-    assert bodies == ()
-    assert "keep it in `deprecates`" in str(error.value)
-    assert "leaves the old memory active" in str(error.value)
+        await _run("memory_update", ctx, body=DEPRECATION, deprecates=["ufo-ai/ufo"])
+        rows = await _rows_by_body()
+    assert rows[DEPRECATION]["deprecates"] == ["ufo-ai/ufo"]
 
 
 async def _backdate(body: str, created_at: datetime) -> datetime:

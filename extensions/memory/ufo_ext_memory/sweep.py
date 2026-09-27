@@ -1,8 +1,8 @@
 """A correction's declared names swept over the rows that carry them.
 
-`memory_update` takes `deprecates`: the names of the things whose current state the row states. The
-handler admits each name — present in the row, and naming no more live rows than one sweep stamps —
-and the names land on the row itself, unswept. `Sweep.run`, the per-minute job, takes every declared
+`memory_update` takes `deprecates`: names from older rows that the correction makes out of date.
+The handler admits each name when it names no more live rows than one sweep stamps, and the names
+land on the row itself, unswept. `Sweep.run`, the per-minute job, takes every declared
 row not yet swept: each live row strictly older than it that carries one of its names as a whole
 name, under the audiences the correction reaches, is stamped `overtaken_by` it, and the row is
 marked swept. Recall then serves each stamped row with the correction quoted under it. No model
@@ -48,28 +48,17 @@ def reach(subject: str, present: frozenset[str]) -> frozenset[str]:
 async def admit(
     store: MemoryStore,
     subject: str,
-    body: str,
     names: tuple[str, ...],
     ceiling: int = SWEEP_MAX_ROWS,
 ) -> frozenset[str]:
-    """The gate a declaration passes before its row commits: each name appears in the row, and each
-    names no more live rows than `ceiling` under the audiences the row reaches. Answers those
-    audiences. A refusal is the tool's error, read and answered by the model in the same turn."""
-    lowered = body.casefold()
-    for name in names:
-        if name.casefold() not in lowered:
-            raise ValueError(
-                f"No memory was saved. `deprecates` name {name!r} must appear verbatim in `body`. "
-                "Retry with that name in `body` and keep it in `deprecates`; omitting "
-                "`deprecates` leaves the old memory active."
-            )
+    """Reject declarations that name too many live rows in the audiences they reach."""
     subjects = reach(subject, await store.subjects_present())
     for name in names:
         count = await store.naming_count(name, subjects)
         if count > ceiling:
             raise ValueError(
                 f"No memory was saved. `deprecates` name {name!r} matches {count} rows. "
-                "Retry with a narrower name in both `body` and `deprecates`; omitting "
+                "Retry with a narrower name in `deprecates`; omitting "
                 "`deprecates` leaves the old memory active."
             )
     return subjects
