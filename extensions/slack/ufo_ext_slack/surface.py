@@ -4800,8 +4800,8 @@ async def _member_dm_channel(bot_token: str, slack_user_id: str) -> str:
             next_cursor = metadata.get("next_cursor") if isinstance(metadata, dict) else None
             cursor = next_cursor if isinstance(next_cursor, str) else ""
             if not cursor:
-                return slack_user_id
-    raise SlackApiError("Slack DM lookup exceeded its page limit")
+                break
+    return slack_user_id
 
 
 async def _chat_post(

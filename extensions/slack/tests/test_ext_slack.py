@@ -7482,6 +7482,26 @@ async def test_a_submit_whose_member_is_linked_names_its_sender_and_sources_its_
     assert len(_fetches(recorder, slack.SLACK_GET_PERMALINK_URL)) == 1
 
 
+async def test_a_dm_past_the_listed_pages_is_posted_to_the_member_id() -> None:
+    sent: list[httpx.Request] = []
+
+    def endless(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channels": [{"id": f"D-{len(sent)}", "is_im": True, "user": "U-other"}],
+                "response_metadata": {"next_cursor": f"page-{len(sent)}"},
+            },
+        )
+
+    with pytest.MonkeyPatch.context() as patch:
+        _patch_httpx(patch, httpx.MockTransport(endless))
+        assert await slack._member_dm_channel(BOT_TOKEN, "U1") == "U1"
+    assert len(sent) == slack.SLACK_CONVERSATIONS_MAX_PAGES
+
+
 async def test_a_targeted_question_is_private_and_answers_its_original_conversation(
     db: None, tmp_path, monkeypatch
 ) -> None:
