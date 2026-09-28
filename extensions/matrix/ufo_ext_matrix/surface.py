@@ -928,9 +928,8 @@ class Installation:
         every cycle, rather than dropping a member's message and advancing the position past it.
 
         A shared file is the message it came as: its caption or its name is what the member said,
-        and
-        everything downstream — ambient history, membership, the proof path — reads it as any other
-        line rather than as a second kind of event."""
+        and everything downstream — ambient history, membership, the proof path — reads it as any
+        other line rather than as a second kind of event."""
         admitting = since is not None
         roster = Roster(ctx)
         self.names.update(room_names(batch))
@@ -971,18 +970,11 @@ class Installation:
             heard.append(entry)
             if own or not admitting:
                 continue
-            if room_id not in joined:
-                try:
-                    joined[room_id] = await client.joined_members(room_id)
-                except MatrixError as error:
-                    if not _refused(error):
-                        raise
-                    log("matrix.room_unreadable", installation=self.bot, http_status=error.status)
-                    joined[room_id] = frozenset()
-            if not joined[room_id]:
+            members = await self._members(client, joined, room_id)
+            if not members:
                 continue
             try:
-                proved = await self._proved(ctx, client, roster, message, joined[room_id])
+                proved = await self._proved(ctx, client, roster, message, members)
             except sa.exc.SQLAlchemyError:
                 raise
             except Exception as error:
@@ -997,8 +989,24 @@ class Installation:
                 heard.pop()
                 continue
             entry.admitted = await self._guarded(
-                self.heed(ctx, roster, client, message, prior, joined[room_id], shared)
+                self.heed(ctx, roster, client, message, prior, members, shared)
             )
+
+    async def _members(
+        self, client: MatrixClient, joined: dict[str, frozenset[str]], room_id: str
+    ) -> frozenset[str]:
+        """Who is joined, asked once a batch and cached. A refusal no retry changes answers empty,
+        so the room is skipped rather than stalling the stream behind it."""
+        if room_id in joined:
+            return joined[room_id]
+        try:
+            joined[room_id] = await client.joined_members(room_id)
+        except MatrixError as error:
+            if not _refused(error):
+                raise
+            log("matrix.room_unreadable", installation=self.bot, http_status=error.status)
+            joined[room_id] = frozenset()
+        return joined[room_id]
 
     async def _guarded(
         self, admission: Awaitable[bool], event: str = "matrix.message_skipped"
