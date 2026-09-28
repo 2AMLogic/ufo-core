@@ -52,6 +52,8 @@ from ufo.sdk.surfaces import (
 
 BOT = "@ufo:example.org"
 HOMESERVER = "https://matrix.example.org"
+
+
 def media_id(filename: str) -> str:
     """The id a media repository answers an upload with."""
     return re.sub(r"[^A-Za-z0-9_-]", "", filename) or "media"

@@ -28,7 +28,8 @@ SINCE_TABLE = sa.Table(
 
 
 class Transactional(Protocol):
-    workspace_id: UUID
+    @property
+    def workspace_id(self) -> UUID: ...
 
     def transaction(self) -> AbstractAsyncContextManager[AsyncConnection]: ...
 

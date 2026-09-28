@@ -238,7 +238,6 @@ def own_calls(node: ast.AST) -> Iterator[ast.Call]:
         yield from own_calls(child)
 
 
-
 def wire_callers(source: str, module: str) -> set[str]:
     """`module.Class.function` for every function in `source` that puts an event on the wire,
     qualified by class."""

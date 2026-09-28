@@ -211,7 +211,7 @@ def room_file(room_id: str, event: Mapping[str, Any]) -> RoomFile | None:
         caption=body if isinstance(body, str) else filename,
         media_type=media_type if isinstance(media_type, str) else "",
         size_bytes=size if isinstance(size, int) and size >= 0 else 0,
-        url=url if plain else "",
+        url=url if isinstance(url, str) else "",
         sealed=sealed if encrypted else None,
         mentions=_mentions(content),
         thread_root=_thread_root(content),

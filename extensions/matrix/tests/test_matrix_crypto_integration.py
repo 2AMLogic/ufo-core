@@ -363,9 +363,7 @@ class Bot:
 
 def bodies(heard: list[tuple[str, Any]]) -> list[str]:
     """The message bodies in what was heard, ciphertext being no message at all."""
-    return [
-        event["content"]["body"] for _room, event in heard if event.get("type") == MESSAGE_TYPE
-    ]
+    return [event["content"]["body"] for _room, event in heard if event.get("type") == MESSAGE_TYPE]
 
 
 async def drain(keys: Keys, user: str, device_id: str) -> list[dict[str, Any]]:
@@ -513,7 +511,6 @@ async def test_a_drained_pool_is_served_by_the_fallback_key(engine: Any, pair: P
         await peer.say(pair.room_id, "on the fallback key")
         assert "on the fallback key" in bodies(await bot.until("on the fallback key"))
         assert bot.fallback_unused()[-1] == []  # the one it published is spent, and it publishes
-
 
 
 @on_loop

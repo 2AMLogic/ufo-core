@@ -200,7 +200,7 @@ class MatrixClient:
 
     async def query_keys(self, users: Sequence[str]) -> Mapping[str, Any]:
         """Every device each user has published keys for, as the homeserver lists them."""
-        body = {"device_keys": {user: [] for user in users}}
+        body: dict[str, Any] = {"device_keys": {user: [] for user in users}}
         answer = await self._call("POST", "/keys/query", "keys_query", json=body)
         devices = answer.get("device_keys")
         return devices if isinstance(devices, Mapping) else {}
