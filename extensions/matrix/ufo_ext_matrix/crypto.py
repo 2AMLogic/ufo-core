@@ -136,16 +136,6 @@ def decode(text: str) -> bytes:
     return base64.b64decode(text + "=" * (-len(text) % 4))
 
 
-def urlsafe(raw: bytes) -> str:
-    """A JWK carries its key in unpadded base64url, which is a different alphabet from the padded
-    base64 an event's other fields use."""
-    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
-
-
-def unurlsafe(text: str) -> bytes:
-    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
-
-
 class FileHashMismatch(Exception):
     """Fetched bytes are not the bytes the sender sealed, so the file is dropped rather than
     decrypted."""
@@ -175,7 +165,9 @@ def seal_file(data: bytes) -> tuple[bytes, dict[str, Any]]:
             "kty": "oct",
             "key_ops": ["encrypt", "decrypt"],
             "alg": FILE_ALGORITHM,
-            "k": urlsafe(key),
+            # A JWK carries its key in unpadded base64url, a different alphabet from the padded
+            # base64 the event's other fields use.
+            "k": base64.urlsafe_b64encode(key).decode().rstrip("="),
             "ext": True,
         },
         "iv": encode(iv),
@@ -222,7 +214,8 @@ def open_file(sealed: Mapping[str, Any], ciphertext: bytes) -> bytes:
     if not isinstance(secret, str) or not isinstance(iv, str):
         raise FileHashMismatch("the file names no key or no iv")
     try:
-        raw_key, raw_iv = unurlsafe(secret), decode(iv)
+        raw_key = base64.urlsafe_b64decode(secret + "=" * (-len(secret) % 4))
+        raw_iv = decode(iv)
     except ValueError as unreadable:
         raise FileHashMismatch("the file's key or iv is not base64") from unreadable
     if len(raw_key) != FILE_KEY_BYTES or len(raw_iv) != FILE_IV_BYTES:
@@ -333,7 +326,7 @@ class Device:
         return f"Device({self.device_id})"
 
     @classmethod
-    async def open(cls, store: CryptoStore, client: MatrixClient) -> "Device":
+    async def open(cls, store: CryptoStore, client: MatrixClient) -> Device:
         """The device's account from the store, or a new one — created once, then published —
         where the store holds none for this `(user, device)`.
 

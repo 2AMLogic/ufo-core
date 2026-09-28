@@ -17,7 +17,6 @@ from typing import Any
 
 import httpx
 import vodozemac as vz
-
 from matrix_fakes import BOT, TOKEN, Homeserver
 
 BOT_DEVICE = "BOTDEVICE"

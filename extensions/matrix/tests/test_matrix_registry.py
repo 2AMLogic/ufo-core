@@ -11,27 +11,27 @@ import pytest
 
 pytest.importorskip("ufo", reason="install ufo from git to run the registry integration test")
 
-from cryptography.fernet import Fernet  # noqa: E402
-
-from ufo.db import apply_migrations  # noqa: E402
-from ufo.host.ext.loader import (  # noqa: E402
-    discovered,
-    durable_surfaces,
-    migration_locations,
-    validate_ext_tools,
-)
-from ufo.host.kinds.surface_kind import registered_surfaces  # noqa: E402
-from ufo.runtime.access.credentials import CredentialStore  # noqa: E402
-from ufo.runtime.skills.runtime import parse_skill  # noqa: E402
-from ufo.sdk.objects import SURFACE_KIND  # noqa: E402
-from ufo_ext_matrix.crypto import STORE_KEY_SLOT  # noqa: E402
-from ufo_ext_matrix.manifest import (  # noqa: E402
+from cryptography.fernet import Fernet
+from ufo_ext_matrix.crypto import STORE_KEY_SLOT
+from ufo_ext_matrix.manifest import (
     CONNECT_TOOL,
     LINK_TOOL,
     SKILL_NAMES,
     UNLINK_TOOL,
 )
-from ufo_ext_matrix.surface import BOTS_ENV, HOMESERVER_SLOT, TOKEN_SLOT  # noqa: E402
+from ufo_ext_matrix.surface import BOTS_ENV, HOMESERVER_SLOT, TOKEN_SLOT
+
+from ufo.db import apply_migrations
+from ufo.host.ext.loader import (
+    discovered,
+    durable_surfaces,
+    migration_locations,
+    validate_ext_tools,
+)
+from ufo.host.kinds.surface_kind import registered_surfaces
+from ufo.runtime.access.credentials import CredentialStore
+from ufo.runtime.skills.runtime import parse_skill
+from ufo.sdk.objects import SURFACE_KIND
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "ufo_ext_matrix" / "migrations"
 

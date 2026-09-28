@@ -15,7 +15,7 @@ import pytest
 
 pytest.importorskip("ufo", reason="install ufo from git to run the linking tests")
 
-from matrix_fakes import (  # noqa: E402
+from matrix_fakes import (
     ALICE,
     BOB,
     BOT,
@@ -30,10 +30,8 @@ from matrix_fakes import (  # noqa: E402
     said,
     text,
 )
-from sqlalchemy.ext.asyncio import AsyncConnection  # noqa: E402
-
-from ufo.sdk.tools import SpeakerRequired  # noqa: E402
-from ufo_ext_matrix.linking import (  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncConnection
+from ufo_ext_matrix.linking import (
     CLAIM_MINUTES,
     CODE_ATTEMPTS,
     EXPIRED_LINE,
@@ -41,15 +39,17 @@ from ufo_ext_matrix.linking import (  # noqa: E402
     LINKED_LINE,
     SPENT_LINE,
     WRONG_LINE,
-    LinkInput,
     Linking,
+    LinkInput,
     UnlinkInput,
     code_in,
     mint_code,
     proof_txn,
 )
-from ufo_ext_matrix.since import write_since  # noqa: E402
-from ufo_ext_matrix.surface import Installation, MatrixSurface  # noqa: E402
+from ufo_ext_matrix.since import write_since
+from ufo_ext_matrix.surface import Installation, MatrixSurface
+
+from ufo.sdk.tools import SpeakerRequired
 
 DM = "!carol-dm:elsewhere.test"
 OTHER = "@dave:elsewhere.test"
@@ -117,7 +117,7 @@ class Rig:
     def __post_init__(self) -> None:
         self.server.members = {ROOM: [BOT, ALICE, BOB], DM: [BOT, OUTSIDER], OTHER_DM: [BOT, OTHER]}
         self.surface = MatrixSurface(
-            transport=self.server.transport, environ={}, linking=Linking(clock=self.clock)
+            transport=self.server.transport, bots="", linking=Linking(clock=self.clock)
         )
         self.installation = Installation(self.surface, Listener(self.workspace), BOT)  # type: ignore[arg-type]
 

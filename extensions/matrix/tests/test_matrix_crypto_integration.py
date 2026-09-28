@@ -32,21 +32,21 @@ pytest.importorskip("ufo", reason="install ufo from git to run the integration t
 pytest.importorskip("vodozemac", reason="install the matrix-e2ee extra to run the crypto tests")
 pytest.importorskip("cryptography", reason="install the matrix-e2ee extra to run the crypto tests")
 
-import vodozemac as vz  # noqa: E402
-from crypto_fakes import MEGOLM, OLM, STORE_KEY, canonical, padded, unpadded  # noqa: E402
-from matrix_fakes import Workspace  # noqa: E402
-from test_matrix_integration import Api, on_loop, workspace_ctx, writeback  # noqa: E402
-from ufo_ext_matrix import crypto  # noqa: E402
-from ufo_ext_matrix.client import MatrixClient  # noqa: E402
-from ufo_ext_matrix.crypto import (  # noqa: E402
+import vodozemac as vz
+from crypto_fakes import MEGOLM, OLM, STORE_KEY, canonical, padded, unpadded
+from matrix_fakes import Workspace
+from test_matrix_integration import Api, on_loop, workspace_ctx, writeback
+from ufo_ext_matrix import crypto
+from ufo_ext_matrix.client import MatrixClient
+from ufo_ext_matrix.crypto import (
     ROOM_KEY,
     SIGNED_KEY,
     STORE_KEY_SLOT,
     device_for,
     inbound,
 )
-from ufo_ext_matrix.events import ENCRYPTED_TYPE, MESSAGE_TYPE, next_batch  # noqa: E402
-from ufo_ext_matrix.surface import MatrixSurface  # noqa: E402
+from ufo_ext_matrix.events import ENCRYPTED_TYPE, MESSAGE_TYPE, next_batch
+from ufo_ext_matrix.surface import MatrixSurface
 
 HOMESERVER = os.environ["MATRIX_INTEGRATION_HOMESERVER"]
 CLIENT = "/_matrix/client/v3"
@@ -466,7 +466,7 @@ async def test_an_encrypted_room_round_trips_through_a_real_homeserver(
         assert ciphertext in str(bot.batches)  # the batch held ciphertext
         assert ciphertext not in str(heard)  # and what was heard of it is words
 
-        surface = MatrixSurface(environ={})
+        surface = MatrixSurface(bots="")
         wb = writeback(uuid4(), pair.room_id)
         reference = await surface.post(ctx, wb)  # type: ignore[arg-type]
         answer = await at_member.event(pair.room_id, reference)
@@ -539,7 +539,7 @@ async def test_the_homeserver_announces_a_members_second_device(engine: Any, pai
     ctx = bot_ctx(engine, pair.bot_token)
     bot = Bot(ctx, pair.bot_token)
     await bot.hear()
-    surface = MatrixSurface(environ={})
+    surface = MatrixSurface(bots="")
 
     async with Keys(pair.member_token) as at_member:
         phone = Peer(at_member, pair.member, pair.member_device, pair.bot, pair.bot_device)

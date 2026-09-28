@@ -22,22 +22,23 @@ import pytest
 
 pytest.importorskip("ufo", reason="install ufo from git to run the integration tests")
 
-from matrix_fakes import Credentials, Workspace, extension_engine  # noqa: E402
-from ufo.sdk.surfaces import (  # noqa: E402
+from matrix_fakes import Credentials, Workspace, extension_engine
+from ufo_ext_matrix.answering import Answering, write_answering
+from ufo_ext_matrix.messages import reply_relation
+from ufo_ext_matrix.surface import (
+    HOMESERVER_SLOT,
+    TOKEN_SLOT,
+    ConnectInput,
+    MatrixSurface,
+)
+
+from ufo.sdk.surfaces import (
     MidTurnReply,
     SharedArtifact,
     SurfaceDeliveryError,
     SurfaceInstallationConflict,
     TerminalFrame,
     Writeback,
-)
-from ufo_ext_matrix.answering import Answering, write_answering  # noqa: E402
-from ufo_ext_matrix.messages import reply_relation  # noqa: E402
-from ufo_ext_matrix.surface import (  # noqa: E402
-    HOMESERVER_SLOT,
-    TOKEN_SLOT,
-    ConnectInput,
-    MatrixSurface,
 )
 
 HOMESERVER = os.environ["MATRIX_INTEGRATION_HOMESERVER"]
@@ -241,7 +242,7 @@ def shared(filename: str, media_type: str, body: bytes) -> SharedArtifact:
 
 @on_loop
 async def test_connect_binds_the_bot_the_token_belongs_to(engine: Any, homes: Homes) -> None:
-    surface = MatrixSurface(environ={})
+    surface = MatrixSurface(bots="")
     installations = Installations(registry={})
     tool = Tool(
         Ext(Credentials({HOMESERVER_SLOT: HOMESERVER, TOKEN_SLOT: homes.bot[1]}), installations)
@@ -266,7 +267,7 @@ async def test_a_reply_reaches_its_room_as_rich_text_under_the_message(
     ctx = workspace_ctx(engine, homes.bot[1])
     turn = uuid4()
     await write_answering(ctx, turn, Answering(homes.room_id, asked))
-    surface = MatrixSurface(environ={})
+    surface = MatrixSurface(bots="")
     wb = writeback(turn, homes.room_id)
     reference = await surface.post(ctx, wb)  # type: ignore[arg-type]
 
@@ -292,7 +293,7 @@ async def test_a_threaded_reply_hangs_under_its_root(engine: Any, homes: Homes) 
     ctx = workspace_ctx(engine, homes.bot[1])
     turn = uuid4()
     await write_answering(ctx, turn, Answering(homes.room_id, asked, root))
-    surface = MatrixSurface(environ={})
+    surface = MatrixSurface(bots="")
     reference = await surface.post(ctx, writeback(turn, homes.room_id))  # type: ignore[arg-type]
 
     async with Api(homes.bot[1]) as bot:
@@ -309,7 +310,7 @@ async def test_shared_files_reach_the_room_as_what_they_are(engine: Any, homes: 
     ctx = workspace_ctx(engine, homes.bot[1])
     ctx.blob.objects = {png.blob_key: png_body, notes.blob_key: notes_body}
     turn = uuid4()
-    surface = MatrixSurface(environ={})
+    surface = MatrixSurface(bots="")
     wb = writeback(turn, homes.room_id, (png, notes))
     reference = await surface.post(ctx, wb)  # type: ignore[arg-type]
     async with Api(homes.bot[1]) as bot:
@@ -334,7 +335,7 @@ async def test_a_recovered_attach_and_a_rehanded_say_land_once(engine: Any, home
     ctx = workspace_ctx(engine, homes.bot[1])
     ctx.blob.objects = {notes.blob_key: notes_body}
     turn = uuid4()
-    surface = MatrixSurface(environ={})
+    surface = MatrixSurface(bots="")
     wb = writeback(turn, homes.room_id, (notes,))
     reference = await surface.post(ctx, wb)  # type: ignore[arg-type]
     async with Api(homes.bot[1]) as bot:
@@ -378,7 +379,7 @@ async def test_another_workspaces_token_is_rejected_from_this_rooms_delivery(
     async with Api(homes.outsider[1]) as outsider:
         await outsider.create_room()  # the outsider's token is real and belongs to someone else
     ctx = workspace_ctx(engine, homes.outsider[1])
-    surface = MatrixSurface(environ={})
+    surface = MatrixSurface(bots="")
     with pytest.raises(SurfaceDeliveryError):
         await surface.post(ctx, writeback(uuid4(), homes.room_id))  # type: ignore[arg-type]
 

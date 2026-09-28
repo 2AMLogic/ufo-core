@@ -17,8 +17,8 @@ import pytest
 
 pytest.importorskip("ufo", reason="install ufo from git to run the degradation tests")
 
-import sqlalchemy as sa  # noqa: E402
-from matrix_fakes import (  # noqa: E402
+import sqlalchemy as sa
+from matrix_fakes import (
     ALICE,
     BOT,
     HOMESERVER,
@@ -31,15 +31,16 @@ from matrix_fakes import (  # noqa: E402
     mention,
     on_loop,
 )
-from ufo.sdk.surfaces import SurfaceDeliveryError, TerminalFrame, Writeback  # noqa: E402
-from ufo_ext_matrix import crypto, crypto_store  # noqa: E402
-from ufo_ext_matrix.client import MatrixClient  # noqa: E402
-from ufo_ext_matrix.crypto import STORE_KEY_SLOT, device_for, outbound  # noqa: E402
-from ufo_ext_matrix.crypto_store import CRYPTO_TABLE, Sealer  # noqa: E402
-from ufo_ext_matrix.e2ee import EXTRA, INSTALL, ExtraMissing  # noqa: E402
-from ufo_ext_matrix.events import MESSAGE_TYPE, TEXT_MSGTYPE  # noqa: E402
-from ufo_ext_matrix.messages import message_content  # noqa: E402
-from ufo_ext_matrix.surface import Installation, MatrixSurface  # noqa: E402
+from ufo_ext_matrix import crypto, crypto_store
+from ufo_ext_matrix.client import MatrixClient
+from ufo_ext_matrix.crypto import STORE_KEY_SLOT, device_for, outbound
+from ufo_ext_matrix.crypto_store import CRYPTO_TABLE, Sealer
+from ufo_ext_matrix.e2ee import EXTRA, INSTALL, ExtraMissing
+from ufo_ext_matrix.events import MESSAGE_TYPE, TEXT_MSGTYPE
+from ufo_ext_matrix.messages import message_content
+from ufo_ext_matrix.surface import Installation, MatrixSurface
+
+from ufo.sdk.surfaces import SurfaceDeliveryError, TerminalFrame, Writeback
 
 MEGOLM = "m.megolm.v1.aes-sha2"
 ENCRYPTED = {"algorithm": MEGOLM}
@@ -74,7 +75,7 @@ async def primed(server: Homeserver, workspace: Workspace) -> Installation:
     server.members = {ROOM: [BOT, ALICE]}
     server.encrypted[ROOM] = ENCRYPTED
     server.syncs.setdefault(None, batch("s1"))
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     installation = Installation(surface, Listener(workspace), BOT)  # type: ignore[arg-type]
     assert await installation.step() == 0.0
     return installation
@@ -164,7 +165,7 @@ async def test_a_post_into_an_encrypted_room_refuses_rather_than_going_out_in_th
     monkeypatch.setattr(crypto, "INSTALLED", False)
     server = Homeserver()
     server.encrypted[ROOM] = ENCRYPTED
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     with pytest.raises(SurfaceDeliveryError):
         await surface.post(workspace, writeback("ready"))  # type: ignore[arg-type]
     assert server.sent == {}
@@ -197,7 +198,7 @@ async def test_a_plain_room_is_served_without_the_extra_as_with_it(
 ) -> None:
     monkeypatch.setattr(crypto, "INSTALLED", False)
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     assert await surface.post(workspace, writeback("ready"))  # type: ignore[arg-type]
     assert [(sent["type"], sent["body"]) for sent in server.sent.values()] == [
         (MESSAGE_TYPE, "ready")

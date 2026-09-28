@@ -18,19 +18,18 @@ import pytest
 
 pytest.importorskip("ufo", reason="install ufo from git to run the surface tests")
 
-import httpx  # noqa: E402
-import sqlalchemy as sa  # noqa: E402
-
-from matrix_fakes import (  # noqa: E402
+import httpx
+import sqlalchemy as sa
+from matrix_fakes import (
     ALICE,
     BOB,
     BOT,
     DIRECT,
+    HOMESERVER,
     OUTSIDER,
     ROOM,
     STRANGER,
     TOKEN,
-    HOMESERVER,
     Credentials,
     Homeserver,
     Listener,
@@ -47,27 +46,12 @@ from matrix_fakes import (  # noqa: E402
     terminal_frame,
     text,
 )
-from ufo.runtime.turns.audience import SHARED_AUDIENCE  # noqa: E402
-from ufo.sdk.audience import foreign_room_audience, room_audience  # noqa: E402
-from ufo.sdk.hub import Activity  # noqa: E402
-from ufo.sdk.surfaces import (  # noqa: E402
-    member_message_attachments,
-    AMBIENT_HISTORY_MESSAGES,
-    NOTHING_DELIVERED,
-    SILENCE_SENTINEL,
-    MidTurnReply,
-    SharedArtifact,
-    SurfaceDeliveryError,
-    SurfaceInstallationConflict,
-    TerminalFrame,
-    Writeback,
-)
-from ufo_ext_matrix.answering import Answering, read_answering  # noqa: E402
-from ufo_ext_matrix.client import MatrixClient, MatrixError  # noqa: E402
-from ufo_ext_matrix.asking import Asking, read_asking, write_asking  # noqa: E402
-from ufo_ext_matrix.events import (  # noqa: E402
-    RoomFile,
+from ufo_ext_matrix.answering import Answering, read_answering
+from ufo_ext_matrix.asking import Asking, read_asking, write_asking
+from ufo_ext_matrix.client import MatrixClient, MatrixError
+from ufo_ext_matrix.events import (
     POLL_START_TYPE,
+    RoomFile,
     answer_txn_id,
     file_txn_id,
     part_txn_id,
@@ -77,29 +61,45 @@ from ufo_ext_matrix.events import (  # noqa: E402
     say_txn_id,
     txn_id,
 )
-from ufo_ext_matrix.feedback import TYPING_TIMEOUT_MS, attend  # noqa: E402
-from ufo_ext_matrix.messages import (  # noqa: E402
+from ufo_ext_matrix.feedback import TYPING_TIMEOUT_MS, attend
+from ufo_ext_matrix.messages import (
     EVENT_LIMIT_BYTES,
     PART_BUDGET_BYTES,
     reply_relation,
 )
-from ufo_ext_matrix.questions import LABELLED_HINT, ONE_HINT, question_block  # noqa: E402
-from ufo_ext_matrix.since import read_since, write_since  # noqa: E402
-from ufo_ext_matrix.surface import (  # noqa: E402
+from ufo_ext_matrix.questions import LABELLED_HINT, ONE_HINT, question_block
+from ufo_ext_matrix.since import read_since, write_since
+from ufo_ext_matrix.surface import (
     CANCELLED_LINE,
     FAILED_LINE,
     FILES_LINE,
     HOMESERVER_SLOT,
     IDLE_SECONDS,
     REPORT_LINK_TEXT,
+    ROSTER_LIMIT,
     TOKEN_SLOT,
     ConnectInput,
     FleetOwnershipLost,
     Installation,
     MatrixSurface,
-    ROSTER_LIMIT,
     asked_questions,
     installations,
+)
+
+from ufo.runtime.turns.audience import SHARED_AUDIENCE
+from ufo.sdk.audience import foreign_room_audience, room_audience
+from ufo.sdk.hub import Activity
+from ufo.sdk.surfaces import (
+    AMBIENT_HISTORY_MESSAGES,
+    NOTHING_DELIVERED,
+    SILENCE_SENTINEL,
+    MidTurnReply,
+    SharedArtifact,
+    SurfaceDeliveryError,
+    SurfaceInstallationConflict,
+    TerminalFrame,
+    Writeback,
+    member_message_attachments,
 )
 
 ROOM_MEMBERS = [BOT, ALICE, BOB]
@@ -108,7 +108,7 @@ FOREIGN = foreign_room_audience("matrix", room_key(ROOM))
 
 
 def rig(server: Homeserver, workspace: Workspace) -> Installation:
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     return Installation(surface, Listener(workspace), BOT)  # type: ignore[arg-type]
 
 
@@ -588,7 +588,7 @@ async def test_a_room_the_bot_was_removed_from_does_not_stall_the_stream(
 async def test_an_unbound_bot_waits_without_calling_out(workspace: Workspace) -> None:
     server = Homeserver()
     installation = Installation(
-        MatrixSurface(transport=server.transport, environ={}),
+        MatrixSurface(transport=server.transport, bots=""),
         Listener(workspace, bound=frozenset()),  # type: ignore[arg-type]
         BOT,
     )
@@ -651,7 +651,7 @@ async def test_one_broken_bot_backs_off_and_never_ends_the_listener(
 async def test_losing_fleet_ownership_ends_the_stream(workspace: Workspace) -> None:
     server = Homeserver()
     installation = Installation(
-        MatrixSurface(transport=server.transport, environ={}),
+        MatrixSurface(transport=server.transport, bots=""),
         Listener(workspace, owned=False),  # type: ignore[arg-type]
         BOT,
     )
@@ -692,7 +692,7 @@ async def test_a_runtime_error_inside_a_round_backs_off_and_never_ends_the_liste
 @on_loop
 async def test_a_post_is_idempotent_under_its_turn(workspace: Workspace) -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(TerminalFrame(status="done", text="The week in one line."))
     first = await surface.post(workspace, wb)  # type: ignore[arg-type]
     again = await surface.post(workspace, wb)  # type: ignore[arg-type]
@@ -705,7 +705,7 @@ async def test_a_post_is_idempotent_under_its_turn(workspace: Workspace) -> None
 @on_loop
 async def test_silence_delivers_nothing(workspace: Workspace) -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(TerminalFrame(status="done", text=SILENCE_SENTINEL))
     assert await surface.post(workspace, wb) is NOTHING_DELIVERED  # type: ignore[arg-type]
     assert server.requests == []
@@ -714,7 +714,7 @@ async def test_silence_delivers_nothing(workspace: Workspace) -> None:
 @on_loop
 async def test_a_failed_turn_posts_the_surfaces_own_line(workspace: Workspace) -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(TerminalFrame(status="failed", text="Traceback: secret internals"))
     await surface.post(workspace, wb)  # type: ignore[arg-type]
     assert server.sent[txn_id(wb.turn_id)]["body"] == FAILED_LINE
@@ -733,7 +733,7 @@ async def test_a_cancelled_turn_posts_cores_reason(
     workspace: Workspace, text: str, posted: str
 ) -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(TerminalFrame(status="cancelled", text=text))
     await surface.post(workspace, wb)  # type: ignore[arg-type]
     assert server.sent[txn_id(wb.turn_id)]["body"] == posted
@@ -744,7 +744,7 @@ async def test_a_rate_limit_carries_the_homeservers_wait(workspace: Workspace) -
     server = Homeserver(
         failure=httpx.Response(429, json={"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 2500})
     )
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     with pytest.raises(SurfaceDeliveryError) as raised:
         await surface.post(workspace, writeback(TerminalFrame(status="done", text="hi")))  # type: ignore[arg-type]
     assert raised.value.retry_after_seconds == 3
@@ -789,7 +789,7 @@ def connecting(values: dict[str, str], *, taken: bool = False) -> Tool:
 
 def test_connect_binds_the_bot_the_token_belongs_to() -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={"UFO_MATRIX_BOTS": BOT})
+    surface = MatrixSurface(transport=server.transport, bots=BOT)
     tool = connecting({HOMESERVER_SLOT: "https://matrix.example.org", TOKEN_SLOT: TOKEN})
     result = asyncio.run(surface.connect(tool, ConnectInput()))  # type: ignore[arg-type]
     assert not result.is_error
@@ -799,7 +799,7 @@ def test_connect_binds_the_bot_the_token_belongs_to() -> None:
 
 def test_connect_names_the_empty_slot_and_binds_nothing() -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     tool = connecting({HOMESERVER_SLOT: "https://matrix.example.org"})
     result = asyncio.run(surface.connect(tool, ConnectInput()))  # type: ignore[arg-type]
     assert TOKEN_SLOT in said(result)
@@ -809,7 +809,7 @@ def test_connect_names_the_empty_slot_and_binds_nothing() -> None:
 
 def test_connect_refuses_a_bad_token_without_repeating_it() -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wrong = "syt_not_the_token"
     tool = connecting({HOMESERVER_SLOT: "https://matrix.example.org", TOKEN_SLOT: wrong})
     result = asyncio.run(surface.connect(tool, ConnectInput()))  # type: ignore[arg-type]
@@ -822,7 +822,7 @@ def test_connect_refuses_a_bot_another_workspace_holds() -> None:
     """One sentence, naming the bot and saying where it does not belong. Which workspace holds it is
     not this workspace's to know, so the refusal says nothing that would identify one."""
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     tool = connecting(
         {HOMESERVER_SLOT: "https://matrix.example.org", TOKEN_SLOT: TOKEN}, taken=True
     )
@@ -837,7 +837,7 @@ def test_connect_again_in_the_same_workspace_replaces_the_binding() -> None:
     """A rotated token for the same bot is the same installation, so a second connect lands rather
     than conflicting with what this workspace already holds."""
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={"UFO_MATRIX_BOTS": BOT})
+    surface = MatrixSurface(transport=server.transport, bots=BOT)
     tool = connecting({HOMESERVER_SLOT: "https://matrix.example.org", TOKEN_SLOT: TOKEN})
     first = asyncio.run(surface.connect(tool, ConnectInput()))  # type: ignore[arg-type]
     second = asyncio.run(surface.connect(tool, ConnectInput()))  # type: ignore[arg-type]
@@ -859,7 +859,7 @@ def test_no_connect_answer_carries_the_token(caplog: pytest.LogCaptureFixture) -
             (refusing, connecting(slots)),
             (server, connecting({HOMESERVER_SLOT: "https://matrix.example.org"})),
         ):
-            surface = MatrixSurface(transport=homeserver.transport, environ={})
+            surface = MatrixSurface(transport=homeserver.transport, bots="")
             answers.append(asyncio.run(surface.connect(tool, ConnectInput())))  # type: ignore[arg-type]
     assert [answer.is_error for answer in answers] == [False, True, True, False]
     for answer in answers:
@@ -871,7 +871,7 @@ def test_no_connect_answer_carries_the_token(caplog: pytest.LogCaptureFixture) -
 async def test_a_reply_renders_as_html_under_the_message_it_answers(workspace: Workspace) -> None:
     server = Homeserver()
     turn = await answered(server, workspace, mention("$m1", ALICE, "summarize the week"))
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(TerminalFrame(status="done", text="**one** line"), turn)
     assert await surface.post(workspace, wb) == "$sent0"  # type: ignore[arg-type]
     sent = server.sent[txn_id(turn)]
@@ -888,7 +888,7 @@ async def test_a_reply_to_a_threaded_message_hangs_under_its_root(workspace: Wor
     threaded["content"]["m.relates_to"] = {"rel_type": "m.thread", "event_id": "$root"}
     turn = await answered(server, workspace, threaded)
     assert await read_answering(workspace, turn) == Answering(ROOM, "$m1", "$root")  # type: ignore[arg-type]
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     await surface.post(workspace, writeback(TerminalFrame(status="done", text="here"), turn))  # type: ignore[arg-type]
     assert server.sent[txn_id(turn)]["m.relates_to"] == reply_relation("$m1", "$root")
 
@@ -896,7 +896,7 @@ async def test_a_reply_to_a_threaded_message_hangs_under_its_root(workspace: Wor
 @on_loop
 async def test_a_turn_no_message_founded_relates_to_nothing(workspace: Workspace) -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(TerminalFrame(status="done", text="the scheduled brief"))
     await surface.post(workspace, wb)  # type: ignore[arg-type]
     assert "m.relates_to" not in server.sent[txn_id(wb.turn_id)]
@@ -906,7 +906,7 @@ async def test_a_turn_no_message_founded_relates_to_nothing(workspace: Workspace
 async def test_a_long_reply_is_written_in_parts_under_one_reference(workspace: Workspace) -> None:
     server = Homeserver()
     turn = await answered(server, workspace, mention("$m1", ALICE, "the whole report please"))
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     paragraph = "word " * 200
     long_reply = "\n\n".join(f"{n}. {paragraph}" for n in range(8))
     wb = writeback(TerminalFrame(status="done", text=long_reply), turn)
@@ -924,7 +924,7 @@ async def test_a_long_reply_is_written_in_parts_under_one_reference(workspace: W
 @on_loop
 async def test_the_detailed_report_is_a_link_and_is_never_uploaded(workspace: Workspace) -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(
         TerminalFrame(status="done", text="Short answer."), artifacts=(report("the write-up"),)
     )
@@ -946,7 +946,7 @@ async def test_a_report_the_turn_named_nothing_reads_as_the_surfaces_own_words(
     workspace: Workspace,
 ) -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(TerminalFrame(status="done", text="Short answer."), artifacts=(report(),))
     workspace.conversations[ROOM] = (wb.conversation_id, SHARED_AUDIENCE)
     await surface.post(workspace, wb)  # type: ignore[arg-type]
@@ -961,7 +961,7 @@ async def test_a_details_report_the_portal_shows_nobody_points_at_the_workspace(
     link: the write-up then reads as the workspace pointer rather than vanishing — a turn whose
     words were silence must never post an empty event."""
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(TerminalFrame(status="done", text=SILENCE_SENTINEL), artifacts=(report(),))
     workspace.conversations[ROOM] = (wb.conversation_id, room_audience("matrix", room_key(ROOM)))
     await surface.post(workspace, wb)  # type: ignore[arg-type]
@@ -974,7 +974,7 @@ async def test_a_details_report_the_portal_shows_nobody_points_at_the_workspace(
 async def test_a_deploy_with_no_portal_offers_no_report_link(workspace: Workspace) -> None:
     server = Homeserver()
     workspace.portal = False
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(TerminalFrame(status="done", text="Short answer."), artifacts=(report("here"),))
     workspace.conversations[ROOM] = (wb.conversation_id, SHARED_AUDIENCE)
     await surface.post(workspace, wb)  # type: ignore[arg-type]
@@ -991,7 +991,7 @@ async def test_shared_files_follow_the_reply_as_what_they_are(workspace: Workspa
     notes = shared("notes.md", "text/markdown")
     workspace.blob.objects = {chart.blob_key: b"\x89PNG", notes.blob_key: b"# notes"}
     wb = writeback(TerminalFrame(status="done", text="Two files."), turn, (chart, notes))
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     reply_ref = await surface.post(workspace, wb)  # type: ignore[arg-type]
     await surface.attach(workspace, wb, str(reply_ref))  # type: ignore[arg-type]
     assert server.uploaded == [("chart.png", b"\x89PNG"), ("notes.md", b"# notes")]
@@ -1012,7 +1012,7 @@ async def test_one_refused_upload_leaves_its_siblings_delivered(workspace: Works
     gone = shared("gone.txt", "text/plain")
     workspace.blob.objects = {huge.blob_key: b"x" * 9, small.blob_key: b"ok"}
     wb = writeback(TerminalFrame(status="done", text="Three files."), artifacts=(huge, small, gone))
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     reply_ref = await surface.post(workspace, wb)  # type: ignore[arg-type]
     await surface.attach(workspace, wb, str(reply_ref))  # type: ignore[arg-type]
     assert server.uploaded == [("small.txt", b"ok")]
@@ -1031,7 +1031,7 @@ async def test_a_rate_limited_upload_raises_so_the_file_is_not_discarded(
     slow = shared("slow.png", "image/png")
     workspace.blob.objects = {slow.blob_key: b"png"}
     wb = writeback(TerminalFrame(status="done", text="One file."), artifacts=(slow,))
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     reply_ref = await surface.post(workspace, wb)  # type: ignore[arg-type]
     with pytest.raises(SurfaceDeliveryError) as raised:
         await surface.attach(workspace, wb, str(reply_ref))  # type: ignore[arg-type]
@@ -1069,7 +1069,7 @@ async def test_a_recovered_delivery_re_attaches_without_re_posting(workspace: Wo
     notes = shared("notes.md", "text/markdown")
     workspace.blob.objects = {notes.blob_key: b"# notes"}
     wb = writeback(TerminalFrame(status="done", text="One file."), artifacts=(notes,))
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     reply_ref = await surface.post(workspace, wb)  # type: ignore[arg-type]
     await surface.attach(workspace, wb, str(reply_ref))  # type: ignore[arg-type]
     await surface.attach(workspace, wb, str(reply_ref))  # type: ignore[arg-type]
@@ -1080,7 +1080,7 @@ async def test_a_recovered_delivery_re_attaches_without_re_posting(workspace: Wo
 @on_loop
 async def test_a_turn_that_shared_nothing_uploads_nothing(workspace: Workspace) -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(TerminalFrame(status="done", text="Nothing shared."))
     await surface.attach(workspace, wb, "$sent0")  # type: ignore[arg-type]
     assert server.requests == []
@@ -1090,7 +1090,7 @@ async def test_a_turn_that_shared_nothing_uploads_nothing(workspace: Workspace) 
 async def test_a_mid_turn_reply_posts_once_under_the_row_it_came_from(workspace: Workspace) -> None:
     server = Homeserver()
     turn = await answered(server, workspace, mention("$m1", ALICE, "keep me posted"))
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     said = MidTurnReply(
         id=uuid4(),
         turn_id=turn,
@@ -1115,7 +1115,7 @@ async def test_a_comment_from_another_surface_reads_as_the_rooms_own_notice(
     workspace: Workspace,
 ) -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     said = MidTurnReply(
         id=uuid4(),
         turn_id=uuid4(),
@@ -1366,7 +1366,7 @@ async def test_a_question_reaches_the_room_as_a_numbered_list_and_a_poll(
     workspace: Workspace,
 ) -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(TerminalFrame(status="done", text="Ready.", question=ROLLOUT))
     reference = await surface.post(workspace, wb)  # type: ignore[arg-type]
     [said] = server.sent_under(txn_id(wb.turn_id))
@@ -1393,7 +1393,7 @@ async def test_an_ask_of_several_questions_reaches_the_room_without_a_poll(
     workspace: Workspace,
 ) -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(TerminalFrame(status="done", question=BOTH))
     reference = await surface.post(workspace, wb)  # type: ignore[arg-type]
     assert server.sent_under(txn_id(wb.turn_id)) == []
@@ -1406,7 +1406,7 @@ async def test_an_ask_of_several_questions_reaches_the_room_without_a_poll(
 @on_loop
 async def test_a_failed_turn_asks_nothing(workspace: Workspace) -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(TerminalFrame(status="failed", question=ROLLOUT))
     await surface.post(workspace, wb)  # type: ignore[arg-type]
     assert [m["body"] for m in server.sent_under(txn_id(wb.turn_id))] == [FAILED_LINE]
@@ -1460,7 +1460,7 @@ async def test_a_redelivered_message_reports_once(workspace: Workspace) -> None:
 @on_loop
 async def test_typing_is_refreshed_while_the_turn_runs(workspace: Workspace) -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
 
     async def frames():
         yield "0", Activity(text="still reading")
@@ -1494,7 +1494,7 @@ async def test_a_homeserver_that_refuses_typing_costs_the_turn_nothing(
     workspace: Workspace,
 ) -> None:
     server = Homeserver()
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
 
     async def frames():
         yield "0", terminal_frame()

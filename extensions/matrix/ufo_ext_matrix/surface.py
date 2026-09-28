@@ -18,7 +18,6 @@ it ends. Each relates its messages to the room message the turn answers, which a
 
 import asyncio
 import math
-import os
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -36,13 +35,13 @@ from ufo.sdk.audience import (
     foreign_room_audience,
     room_audience,
 )
+from ufo.sdk.credentials import deploy_env
 from ufo.sdk.http import Request
 from ufo.sdk.o11y import log, warn
 from ufo.sdk.surfaces import (
-    ATTACHED_FILES_CLAUSE,
-    inbox_name,
     AMBIENT_CONTEXT_ELEMENT,
     AMBIENT_HISTORY_MESSAGES,
+    ATTACHED_FILES_CLAUSE,
     NOTHING_DELIVERED,
     Admitted,
     AmbientMessage,
@@ -59,6 +58,7 @@ from ufo.sdk.surfaces import (
     TurnContext,
     Writeback,
     fence_member_message,
+    inbox_name,
     is_silence_sentinel,
     mint_marker,
     writeback_says_nothing,
@@ -99,8 +99,8 @@ from ufo_ext_matrix.events import (
     poll_answer,
     poll_txn_id,
     question_txn_id,
-    room_key,
     room_file,
+    room_key,
     room_message,
     room_names,
     say_txn_id,
@@ -110,8 +110,8 @@ from ufo_ext_matrix.events import (
 from ufo_ext_matrix.feedback import attend
 from ufo_ext_matrix.linking import Linking, _said, code_in, proof_txn, unlinked
 from ufo_ext_matrix.messages import (
-    encrypted_file_content,
     edit_content,
+    encrypted_file_content,
     file_content,
     message_content,
     msgtype_for,
@@ -130,7 +130,8 @@ from ufo_ext_matrix.questions import (
 )
 from ufo_ext_matrix.since import read_since, write_since
 
-BOTS_ENV = "UFO_MATRIX_BOTS"
+BOTS_KEY = "MATRIX_BOTS"
+BOTS_ENV = f"UFO_{BOTS_KEY}"
 HOMESERVER_SLOT = "matrix_homeserver"
 TOKEN_SLOT = "matrix_access_token"
 IDLE_SECONDS = 30.0
@@ -220,12 +221,6 @@ def asked_questions(question: AskUserInput) -> tuple[Asked, ...]:
         )
         for asked in question.questions
     )
-
-
-def shared_files(writeback: Writeback) -> tuple[SharedArtifact, ...]:
-    """The files a turn shared, which a room carries as messages of their own. A detailed write-up
-    is not one of them: it reaches the member as the link the reply carries."""
-    return tuple(a for a in writeback.artifacts if a.role == FILE_ROLE)
 
 
 async def report_links(ctx: SurfaceContext, writeback: Writeback) -> tuple[str, ...]:
@@ -361,15 +356,21 @@ class MatrixSurface:
     builds one over a fake homeserver."""
 
     transport: httpx.AsyncBaseTransport | None = None
-    environ: Mapping[str, str] = field(default_factory=lambda: os.environ)
+    bots: str | None = None
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     linking: Linking = field(default_factory=Linking)
+
+    def listening(self) -> tuple[str, ...]:
+        """The bot MXIDs this deploy's listener runs, from `MATRIX_BOTS`; a test names them
+        directly."""
+        named = self.bots if self.bots is not None else (deploy_env(BOTS_KEY) or "")
+        return installations(named)
 
     def client(self, homeserver: str, access_token: str) -> MatrixClient:
         return MatrixClient(homeserver, access_token, transport=self.transport)
 
     async def listen(self, listener: SurfaceListenerContext) -> None:
-        bots = installations(self.environ.get(BOTS_ENV, ""))
+        bots = self.listening()
         if not bots:
             log("matrix.no_installations", env=BOTS_ENV)
             await asyncio.Event().wait()
@@ -472,7 +473,9 @@ class MatrixSurface:
         failure a retry can fix, a rate limit or a lost database among them, raises, so the file is
         not discarded to a transient outage. Delivery repeats after a crash, and a file already
         sent is sent under the transaction id it was sent under before."""
-        files = shared_files(writeback)
+        # A detailed write-up is not a shared file: it reaches the member as the link the
+        # reply carries, so only FILE_ROLE artifacts become messages of their own.
+        files = tuple(a for a in writeback.artifacts if a.role == FILE_ROLE)
         if not files:
             return
         homeserver, token = await self.slots(ctx)
@@ -656,7 +659,7 @@ class MatrixSurface:
             await ext.installations.bind(SURFACE, bot)
         except SurfaceInstallationConflict:
             return _said(f"{bot} is already connected to another workspace.", error=True)
-        listed = bot in installations(self.environ.get(BOTS_ENV, ""))
+        listed = bot in self.listening()
         tail = (
             "It is listening." if listed else f"It listens once the deploy's {BOTS_ENV} names it."
         )

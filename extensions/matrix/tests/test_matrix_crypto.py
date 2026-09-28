@@ -14,9 +14,9 @@ pytest.importorskip("ufo", reason="install ufo from git to run the crypto tests"
 pytest.importorskip("vodozemac", reason="install the matrix-e2ee extra to run the crypto tests")
 pytest.importorskip("cryptography", reason="install the matrix-e2ee extra to run the crypto tests")
 
-import sqlalchemy as sa  # noqa: E402
-import vodozemac as vz  # noqa: E402
-from crypto_fakes import (  # noqa: E402
+import sqlalchemy as sa
+import vodozemac as vz
+from crypto_fakes import (
     BOT_DEVICE,
     MEGOLM,
     READY,
@@ -25,7 +25,7 @@ from crypto_fakes import (  # noqa: E402
     Peer,
     Verifier,
 )
-from matrix_fakes import (  # noqa: E402
+from matrix_fakes import (
     ALICE,
     BOB,
     BOT,
@@ -38,34 +38,42 @@ from matrix_fakes import (  # noqa: E402
     batch,
     on_loop,
 )
-from ufo.sdk.surfaces import (  # noqa: E402
-    MidTurnReply,
-    SharedArtifact,
-    SurfaceDeliveryError,
-    TerminalFrame,
-    Writeback,
-)
-from ufo_ext_matrix import crypto  # noqa: E402
-from ufo_ext_matrix.client import MatrixClient  # noqa: E402
-from ufo_ext_matrix.events import RoomFile  # noqa: E402
-from ufo_ext_matrix.crypto import STORE_KEY_SLOT, device_for  # noqa: E402
-from ufo_ext_matrix.crypto_store import (  # noqa: E402
+from ufo_ext_matrix import crypto
+from ufo_ext_matrix.client import MatrixClient
+from ufo_ext_matrix.crypto import STORE_KEY_SLOT, device_for
+from ufo_ext_matrix.crypto_store import (
     CRYPTO_TABLE,
     CryptoStore,
     Rows,
     Sealer,
     StoreLocked,
 )
-from ufo_ext_matrix.events import txn_id  # noqa: E402
-from ufo_ext_matrix.since import read_since  # noqa: E402
-from ufo_ext_matrix.surface import HOMESERVER_SLOT, TOKEN_SLOT, Installation, MatrixSurface  # noqa: E402
+from ufo_ext_matrix.events import (
+    RoomFile,
+    txn_id,
+)
+from ufo_ext_matrix.since import read_since
+from ufo_ext_matrix.surface import (
+    HOMESERVER_SLOT,
+    TOKEN_SLOT,
+    Installation,
+    MatrixSurface,
+)
+
+from ufo.sdk.surfaces import (
+    MidTurnReply,
+    SharedArtifact,
+    SurfaceDeliveryError,
+    TerminalFrame,
+    Writeback,
+)
 
 ENCRYPTED = {"algorithm": MEGOLM}
 
 
 def rig(server: E2EHomeserver, workspace: Workspace) -> Installation:
     """A fresh surface and installation, as a restarted process builds them."""
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     return Installation(surface, Listener(workspace), BOT)  # type: ignore[arg-type]
 
 
@@ -89,7 +97,7 @@ async def post(server: E2EHomeserver, workspace: Workspace, room_id: str, text: 
         terminal=TerminalFrame(status="done", text=text),
         artifacts=(),
     )
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     await surface.post(workspace, wb)  # type: ignore[arg-type]
     return server.sent[txn_id(wb.turn_id)]
 
@@ -639,7 +647,7 @@ async def test_every_delivery_handler_encrypts_what_it_sends(workspace: Workspac
     server.encrypted[DIRECT] = ENCRYPTED
     await primed(server, workspace)
     alice = Peer(server, ALICE, "ALICEPHONE")
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
 
     chart = SharedArtifact(
         id=uuid4(),
@@ -850,7 +858,7 @@ async def test_a_shared_file_costs_one_reading_of_the_rooms_encryption(
     server = E2EHomeserver()
     server.encrypted[DIRECT] = ENCRYPTED
     await primed(server, workspace)
-    surface = MatrixSurface(transport=server.transport, environ={})
+    surface = MatrixSurface(transport=server.transport, bots="")
     chart = SharedArtifact(
         id=uuid4(),
         blob_key="blob-chart",
