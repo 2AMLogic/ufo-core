@@ -45,6 +45,12 @@ dependencies = [
     "emoji>=2.15",
 ]
 
+[project.optional-dependencies]
+# Olm and Megolm for the matrix surface's encrypted rooms. Optional because a deploy whose rooms are
+# unencrypted needs no native crypto in its image, and the extension degrades to refusing an
+# encrypted room rather than failing to load — see extensions/matrix/README.md.
+matrix-e2ee = ["vodozemac>=0.9"]
+
 [project.scripts]
 ufoctl = "ufo.cli:main"
 
@@ -65,6 +71,7 @@ gbrain = "ufo_ext_gbrain.manifest:manifest"
 index_default = "ufo_ext_index_default:manifest"
 keyed_connectors = "ufo_ext_keyed_connectors:manifest"
 mcp = "ufo_ext_mcp:manifest"
+matrix = "ufo_ext_matrix.manifest:manifest"
 memory = "ufo_ext_memory.manifest:manifest"
 monitors = "ufo_ext_monitors.manifest:manifest"
 openrouter = "ufo_ext_openrouter:manifest"
@@ -130,14 +137,15 @@ packages = [
     "extensions/debugger/ufo_ext_debugger",
     "extensions/documents/ufo_ext_documents",
     "extensions/gbrain/ufo_ext_gbrain",
+    "extensions/matrix/ufo_ext_matrix",
     "extensions/memory/ufo_ext_memory",
     "extensions/monitors/ufo_ext_monitors",
     "extensions/pipedream/ufo_ext_pipedream",
     "extensions/rag/ufo_ext_rag",
     "extensions/redis_hub/ufo_ext_redis_hub",
-    "extensions/research/ufo_ext_research",
-    "extensions/report_digest/ufo_ext_report_digest",
     "extensions/repl/ufo_ext_repl",
+    "extensions/report_digest/ufo_ext_report_digest",
+    "extensions/research/ufo_ext_research",
     "extensions/sample/ufo_ext_sample",
     "extensions/scheduled_tasks/ufo_ext_scheduled_tasks",
     "extensions/sites/ufo_ext_sites",
