@@ -7,9 +7,9 @@ the same resolution; the egress wire itself is the standalone Rust `ufo-egress` 
 import os
 
 from ufo.config import Config
-from ufo.runtime.ext.manifest import Manifest
 from ufo.runtime.access.credentials import deploy_env
 from ufo.runtime.access.egress_rules import Rule, ScopeRule, derive_model_rules
+from ufo.runtime.ext.manifest import Manifest
 
 MODEL_PROBES = ("claude-opus-4-8", "gpt-5")
 OWNER_DSN_ENV = "UFO_OWNER_DSN"
@@ -26,6 +26,8 @@ def model_rule_base(config: Config, manifests: tuple[Manifest, ...] = ()) -> tup
     rules. Failing boot on the two core key envs alone refuses to start a deploy that works, which
     is why `manifests` is read here: a provider declared by an active extension, with its key set,
     means the deploy has a brain and boot proceeds with no sandbox model route rather than none.
+    Only a keyed one counts — an extension is active because the pack bundles it, not because the
+    operator filled its key, so an unkeyed provider is no evidence the deploy can reach a model.
 
     The one place a deploy's model hosts become egress rules."""
     key_envs = (config.models.anthropic_api_key_env, config.models.openai_api_key_env)
@@ -40,22 +42,14 @@ def model_rule_base(config: Config, manifests: tuple[Manifest, ...] = ()) -> tup
                 hosts |= rule.allowed_hosts
             else:
                 rules.append(rule)
-    if not hosts and not extension_model_providers(manifests):
-        raise RuntimeError("no model provider key set; the sandbox would have no egress route")
-    return (ScopeRule(allowed_hosts=frozenset(hosts)), *rules)
-
-
-def extension_model_providers(manifests: tuple[Manifest, ...]) -> frozenset[str]:
-    """The key envs of model providers an active extension declares, set in this deploy's env.
-
-    Only the *set* ones count: an extension is active because the pack bundles it, not because the
-    operator filled its key, so an unkeyed provider is no evidence the deploy can reach a model."""
-    return frozenset(
-        spec.key_env
+    extension_keyed = any(
+        spec.key_env and deploy_env(spec.key_env)
         for manifest in manifests
         for spec in manifest.models
-        if spec.key_env and deploy_env(spec.key_env)
     )
+    if not hosts and not extension_keyed:
+        raise RuntimeError("no model provider key set; the sandbox would have no egress route")
+    return (ScopeRule(allowed_hosts=frozenset(hosts)), *rules)
 
 
 def owner_dsn(config: Config) -> str:

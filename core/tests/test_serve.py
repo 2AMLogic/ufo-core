@@ -7,8 +7,8 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, cast
 from types import SimpleNamespace
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -42,6 +42,7 @@ from ufo.db import dispose_db, init_db, workspace_tx
 from ufo.harness.auth.bearer import UFO_TOKEN_SECRET_ENV
 from ufo.harness.models.catalog import CORE_MODEL_SPECS, CORE_PRICING
 from ufo.harness.models.registry import ModelRegistry
+from ufo.harness.models.spec import ModelPrice, ModelSpec, ReasoningSupport
 from ufo.harness.sandbox.local import LocalCarrier
 from ufo.harness.sandbox.session import EGRESS_CA_CERT_ENV, RunTokenCodec
 from ufo.host.ext.loader import deploy_claims, load_manifests
@@ -52,7 +53,6 @@ from ufo.runtime.access.egress_rules import InjectionRule, ScopeRule
 from ufo.runtime.access.workspace_slots import WorkspaceSlots
 from ufo.runtime.billing.accounting import UNGATED_LEDGER
 from ufo.runtime.billing.spend import GateDeploy
-from ufo.harness.models.spec import ModelPrice, ModelSpec, ReasoningSupport
 from ufo.runtime.ext.manifest import CarrierSpec, CredentialSlot, InjectionTarget, Manifest
 from ufo.runtime.ext.operator import install_operator, installed_operator
 from ufo.runtime.ext.surface import SurfaceSpec
@@ -636,10 +636,8 @@ def _extension_model_manifest(key_env: str) -> Manifest:
 def test_model_rule_base_boots_when_only_an_extension_serves_models(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A deploy whose every model comes from an extension has a brain, and those calls are
-    host-side — they never touch these rules. Refusing to boot on the two core key envs alone
-    refuses to start a deploy that works, which is what `ufoctl serve` did for an OpenRouter-only
-    deploy: `no model provider key set`, with `OPENROUTER_API_KEY` set the whole time."""
+    """An extension's models are host-side and never touch these rules, so the two core key envs
+    do not decide whether this deploy has a brain."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("UFO_ANTHROPIC_API_KEY", raising=False)
@@ -658,11 +656,11 @@ def test_model_rule_base_boots_when_only_an_extension_serves_models(
 def test_model_rule_base_still_fails_when_nothing_serves_models(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The loud failure is what stands between a deploy and a turn that cannot think. An extension
-    is active because a pack bundles it, not because its key is filled, so an unkeyed provider is
-    no evidence of a brain."""
-    for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "UFO_ANTHROPIC_API_KEY", "UFO_OPENAI_API_KEY"):
-        monkeypatch.delenv(name, raising=False)
+    """An extension is active because a pack bundles it, not because its key is filled, so an
+    unkeyed provider is no evidence of a brain."""
+    for prefix in ("", "UFO_"):
+        for provider in ("ANTHROPIC", "OPENAI"):
+            monkeypatch.delenv(f"{prefix}{provider}_API_KEY", raising=False)
     monkeypatch.delenv("ROUTER_API_KEY", raising=False)
 
     with pytest.raises(RuntimeError, match="no model provider key set"):
