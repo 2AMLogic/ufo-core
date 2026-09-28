@@ -7,6 +7,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, cast
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -51,6 +52,7 @@ from ufo.runtime.access.egress_rules import InjectionRule, ScopeRule
 from ufo.runtime.access.workspace_slots import WorkspaceSlots
 from ufo.runtime.billing.accounting import UNGATED_LEDGER
 from ufo.runtime.billing.spend import GateDeploy
+from ufo.harness.models.spec import ModelPrice, ModelSpec, ReasoningSupport
 from ufo.runtime.ext.manifest import CarrierSpec, CredentialSlot, InjectionTarget, Manifest
 from ufo.runtime.ext.operator import install_operator, installed_operator
 from ufo.runtime.ext.surface import SurfaceSpec
@@ -608,6 +610,63 @@ def test_model_rule_base_boots_on_the_ufo_prefixed_key_alone(
     monkeypatch.setenv("UFO_ANTHROPIC_API_KEY", "sk-ant-ufo-scoped")
     injected = [r for r in model_rule_base(_hosted_config()) if isinstance(r, InjectionRule)]
     assert [rule.real for rule in injected] == ["sk-ant-ufo-scoped"]
+
+
+def _extension_model_manifest(key_env: str) -> Manifest:
+    """A manifest declaring one model this deploy can run, the way `openrouter` does."""
+    return Manifest(
+        name="router",
+        version="0.1.0",
+        models=(
+            ModelSpec(
+                id="router/some-model",
+                provider="router",
+                client=lambda spec, key: cast(Any, None),
+                price=ModelPrice(1, 1, 0, 0, 0),
+                knowledge_cutoff="2026-01",
+                context_window=100_000,
+                reasoning=ReasoningSupport(supported=False, tools_with_reasoning=False),
+                api_surface="chat",
+                key_env=key_env,
+            ),
+        ),
+    )
+
+
+def test_model_rule_base_boots_when_only_an_extension_serves_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deploy whose every model comes from an extension has a brain, and those calls are
+    host-side — they never touch these rules. Refusing to boot on the two core key envs alone
+    refuses to start a deploy that works, which is what `ufoctl serve` did for an OpenRouter-only
+    deploy: `no model provider key set`, with `OPENROUTER_API_KEY` set the whole time."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("UFO_ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("UFO_OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ROUTER_API_KEY", "sk-router")
+
+    rules = model_rule_base(_hosted_config(), (_extension_model_manifest("ROUTER_API_KEY"),))
+
+    scope = next(rule for rule in rules if isinstance(rule, ScopeRule))
+    assert scope.allowed_hosts == frozenset(), (
+        "the deploy boots, and says honestly that no model host is reachable from the sandbox"
+    )
+    assert not [rule for rule in rules if isinstance(rule, InjectionRule)]
+
+
+def test_model_rule_base_still_fails_when_nothing_serves_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The loud failure is what stands between a deploy and a turn that cannot think. An extension
+    is active because a pack bundles it, not because its key is filled, so an unkeyed provider is
+    no evidence of a brain."""
+    for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "UFO_ANTHROPIC_API_KEY", "UFO_OPENAI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("ROUTER_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="no model provider key set"):
+        model_rule_base(_hosted_config(), (_extension_model_manifest("ROUTER_API_KEY"),))
 
 
 def test_proxy_endpoint_is_built_from_config_and_the_shared_ca(
