@@ -1565,7 +1565,9 @@ async def test_a_file_uploaded_comes_back_by_its_mxc(workspace: Workspace) -> No
 
 
 @on_loop
-async def test_a_download_of_nothing_raises_rather_than_returning_empty(workspace: Workspace) -> None:
+async def test_a_download_of_nothing_raises_rather_than_returning_empty(
+    workspace: Workspace,
+) -> None:
     """A media id the repository does not hold is an error, not zero bytes — an empty file and an
     absent one read identically to a caller that only checks the length."""
     server = Homeserver()
@@ -1638,13 +1640,17 @@ async def test_a_file_declaring_too_much_is_never_fetched(workspace: Workspace) 
     installation = rig(server, workspace)
     async with MatrixClient(HOMESERVER, TOKEN, transport=server.transport) as client:
         before = len(server.requests)
-        got = await installation.fetched(client, _shared(url="mxc://example.org/x", size=99), limit=8)
+        got = await installation.fetched(
+            client, _shared(url="mxc://example.org/x", size=99), limit=8
+        )
         assert len(server.requests) == before
     assert got is None
 
 
 @on_loop
-async def test_a_file_the_repository_does_not_hold_is_dropped_not_raised(workspace: Workspace) -> None:
+async def test_a_file_the_repository_does_not_hold_is_dropped_not_raised(
+    workspace: Workspace,
+) -> None:
     """A member's attachment must not stop their room being read: the fetch failure costs that
     file and the stream goes on."""
     server = Homeserver()
@@ -1701,8 +1707,8 @@ async def test_a_file_the_workspace_refuses_costs_the_file_and_not_the_turn(
 async def test_a_member_cannot_name_a_path_out_of_the_uploads_directory(
     workspace: Workspace,
 ) -> None:
-    """The filename is the sender's to choose and it reaches a workspace path, so it is a name and
-    never a path. `../notes.md` landing as `uploads/../notes."""
+    """The filename is the sender's to choose and reaches a workspace path, so it is a name and
+    never a path: `../notes.md` would land at the workspace root, in bounds and arbitrary."""
     server = Homeserver()
     installation = await primed(server, workspace)
     async with MatrixClient(HOMESERVER, TOKEN, transport=server.transport) as client:
@@ -1721,8 +1727,8 @@ async def test_a_member_cannot_name_a_path_out_of_the_uploads_directory(
 
 @on_loop
 async def test_two_files_under_one_name_land_beside_each_other(workspace: Workspace) -> None:
-    """A workspace path is a place, so a second `chart.png` delivered to the path the first holds
-    replaces it — and the turn reading `uploads/chart."""
+    """A workspace path is a place, so a second `chart.png` would replace the first and a turn would
+    read the wrong member's bytes under a fence naming the right member's file."""
     server = Homeserver()
     installation = await primed(server, workspace)
     async with MatrixClient(HOMESERVER, TOKEN, transport=server.transport) as client:

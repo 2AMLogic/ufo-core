@@ -465,7 +465,7 @@ async def test_a_start_in_the_clear_is_refused(
     installation = await primed(server, workspace)
     alice = Peer(server, ALICE, "ALICEPHONE")
     verifier = Verifier(alice)
-    verifier.begin(clear=True)
+    verifier.send_start(clear=True)
     with caplog.at_level(logging.DEBUG):
         await installation.step()
     verifier.answer()
@@ -790,9 +790,8 @@ def test_a_hash_that_does_not_match_is_never_decrypted(monkeypatch: pytest.Monke
 
 
 def test_a_malformed_file_is_a_dropped_file_and_never_an_unhandled_error() -> None:
-    """Every field is a hostile sender's, the whole object included — a shape escaping as
-    `AttributeError` turns a dropped attachment into an unhandled error in whoever reads the
-    room."""
+    """Every field is a hostile sender's — a shape escaping as `AttributeError` turns a dropped
+    attachment into an unhandled error in whoever reads the room."""
     ciphertext, sealed = crypto.seal_file(b"a file")
     for broken in (
         "gotcha",

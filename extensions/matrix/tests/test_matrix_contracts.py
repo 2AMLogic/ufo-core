@@ -10,7 +10,8 @@ the transition-language ban is about. Two carve-outs, each scoped to a version t
 get
 to rename: `PROTOCOL_NAMES` is a dotted Matrix event or algorithm name (`m.megolm.v1.aes-sha2`), and
 `WIRE_VERSIONS` is a version token a wire value carries — quoted alone, as an `EncryptedFile` names
-its format (`"v": "v2"`); a path segment, as a homeserver names its API (`/_matrix/client/v1/media`);
+its format (`"v": "v2"`); a path segment, as a homeserver names its API
+(`/_matrix/client/v1/media`);
 or the tail of a quoted value, as the spec names a SAS MAC method (`"hkdf-hmac-sha256.v2"`).
 
 Each strikes to a space rather than to nothing, because removing a token joins what sat either side
@@ -237,11 +238,6 @@ def own_calls(node: ast.AST) -> Iterator[ast.Call]:
         yield from own_calls(child)
 
 
-def dotted(path: Path) -> str:
-    """A module's name for a failure to quote, qualified by the directories it sits in, so a
-    `client.py` under a subdirectory does not report under the transport's own name."""
-    return ".".join(path.relative_to(PACKAGE).with_suffix("").parts)
-
 
 def wire_callers(source: str, module: str) -> set[str]:
     """`module.Class.function` for every function in `source` that puts an event on the wire,
@@ -273,11 +269,14 @@ def guarded_paths() -> list[Path]:
 
 
 def test_only_one_seam_puts_a_message_on_the_wire() -> None:
-    """`MatrixSurface."""
+    """`MatrixSurface.send` is where an event meets `outbound`, so an encrypted room takes
+    ciphertext whichever handler speaks; one calling the client directly reaches it in the clear."""
     callers = {
         caller
         for path in guarded_paths()
-        for caller in wire_callers(path.read_text(), dotted(path))
+        for caller in wire_callers(
+            path.read_text(), ".".join(path.relative_to(PACKAGE).with_suffix("").parts)
+        )
     }
     assert callers == {SEAM}, f"a message leaves outside the seam, from {sorted(callers)}"
 

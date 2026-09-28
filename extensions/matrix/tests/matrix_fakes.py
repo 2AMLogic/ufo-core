@@ -331,9 +331,8 @@ class Workspace:
     blob: Blob = field(default_factory=Blob)
     portal: bool = True
     question: AskUserInput | None = None
-    # Which question indexes are still open, None meaning all of them. Core keeps this record behind
-    # `answerable_question` and closes an index when an answer lands; here a test sets it outright,
-    # and an admitted answer closes nothing, so a redelivery is gated by the admission key alone.
+    # Open question indexes, None meaning all. A test sets it outright and an admitted answer closes
+    # nothing, so a redelivery is gated by the admission key alone.
     open_questions: frozenset[int] | None = None
     frames: tuple[LiveFrame, ...] = (Activity(text="reading the week"),)
     endless: bool = False

@@ -46,9 +46,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Olm and Megolm for the matrix surface's encrypted rooms. Optional because a deploy whose rooms are
-# unencrypted needs no native crypto in its image, and the extension degrades to refusing an
-# encrypted room rather than failing to load — see extensions/matrix/README.md.
+# Olm and Megolm for the matrix surface. Without it the extension refuses an encrypted room rather
+# than failing to load, so an unencrypted deploy carries no native crypto. See its README.
 matrix-e2ee = ["vodozemac>=0.9"]
 
 [project.scripts]

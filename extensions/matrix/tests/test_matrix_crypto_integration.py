@@ -143,8 +143,8 @@ class Keys(Api):
 
 @dataclass
 class Peer:
-    """One of the member's devices, over its own vodozemac account and its own access token.
-    `crypto_fakes."""
+    """One of the member's devices over its own account and token, against the real client-server
+    API rather than a fake transport; `claimed` holds what the homeserver handed out."""
 
     keys: Keys
     user: str
@@ -518,8 +518,8 @@ async def test_a_drained_pool_is_served_by_the_fallback_key(engine: Any, pair: P
 
 @on_loop
 async def test_the_homeserver_announces_a_members_second_device(engine: Any, pair: Pair) -> None:
-    """A member's new device is the homeserver's news to carry: it names the member in
-    `device_lists."""
+    """A new device is the homeserver's news to carry: it names the member in
+    `device_lists.changed`, and the bot outdates what it pinned and shares the session."""
     ctx = bot_ctx(engine, pair.bot_token)
     bot = Bot(ctx, pair.bot_token)
     await bot.hear()
@@ -555,8 +555,8 @@ async def test_the_homeserver_announces_a_members_second_device(engine: Any, pai
 async def test_the_media_repository_holds_ciphertext_and_serves_it_where_we_ask(
     engine: Any, pair: Pair
 ) -> None:
-    """A fake cannot falsify the assumption it was built from: its routing and the client's path came
-    from one belief about which endpoint serves authenticated media. Only a homeserver can."""
+    """A fake cannot falsify the assumption it was built from: its routing and the client's
+    path came from one belief about which endpoint serves. Only a homeserver can."""
     plaintext = b"the quarterly numbers, in confidence" * 8
     ciphertext, sealed = crypto.seal_file(plaintext)
 

@@ -354,8 +354,8 @@ class Peer:
 
 @dataclass
 class Verifier:
-    """A member's client verifying the bot's device over SAS, driving its own half of the exchange.
-    `answer` reads whatever the bot sent this device and replies as a client does: a `."""
+    """A member's client driving its own half of a SAS exchange. `answer` replies as a client does,
+    and with `honest` false the MAC covers a key this device does not hold."""
 
     peer: Peer
     transaction: str = "t-verify"
@@ -385,7 +385,7 @@ class Verifier:
             },
         )
 
-    def begin(self, *, clear: bool = False) -> None:
+    def send_start(self, *, clear: bool = False) -> None:
         self.start = {
             "transaction_id": self.transaction,
             "from_device": self.peer.device_id,
@@ -407,7 +407,7 @@ class Verifier:
             if content.get("transaction_id") != self.transaction:
                 continue
             if kind == READY:
-                self.begin()
+                self.send_start()
             elif kind == ACCEPT:
                 self.commitment = content["commitment"]
                 self.strings = content["short_authentication_string"]
