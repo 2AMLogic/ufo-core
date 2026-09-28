@@ -306,9 +306,8 @@ async def exchange(installation: Installation, verifier: Verifier, rounds: int =
 
 @on_loop
 async def test_a_member_verifies_the_bots_device_over_sas(workspace: Workspace) -> None:
-    """The member's client starts, and the bot answers every event of the exchange — no command, no
-    keyword, nothing but to-device protocol. The client's MAC over the bot's device key is the
-    verification the member asked for, and the bot records which device confirmed it."""
+    """The member's client starts and the bot answers every event over to-device protocol alone; the
+    client's MAC over the bot's device key is the verification, and the bot records which device."""
     server = E2EHomeserver()
     server.encrypted[DIRECT] = ENCRYPTED
     installation = await primed(server, workspace)
@@ -357,9 +356,8 @@ def in_flight(workspace: Workspace) -> list[crypto.Verifying]:
 async def test_an_exchange_older_than_the_age_bound_is_not_answered(
     workspace: Workspace,
 ) -> None:
-    """The age bound holds on a bot nobody else is verifying, where no later exchange starts to
-    sweep this one. A `.key` for an exchange `EXCHANGE_SECONDS` old — the age the bound counts as
-    let go — is answered with `m.unknown_transaction` and never with this end's key."""
+    """The age bound holds where no later exchange sweeps this one: a `.key` at `EXCHANGE_SECONDS`
+    answers `m.unknown_transaction` and never this end's key."""
     server = E2EHomeserver()
     server.encrypted[DIRECT] = ENCRYPTED
     installation = await primed(server, workspace)
@@ -397,9 +395,8 @@ async def opened(server: E2EHomeserver, workspace: Workspace) -> crypto.Device:
 async def test_one_workspaces_exchanges_outlive_anothers_filling_the_table(
     workspace: Workspace,
 ) -> None:
-    """`EXCHANGE_LIMIT` counts one workspace's exchanges. A member opening exchange after exchange
-    lets go of their own workspace's oldest and of no other workspace's, so a bot serving several
-    workspaces has no member who can end another's verification."""
+    """`EXCHANGE_LIMIT` counts one workspace's exchanges, so no member can end another workspace's
+    verification by opening exchange after exchange."""
     theirs = Workspace(engine=workspace.engine)
     ours = await opened(E2EHomeserver(), workspace)
     neighbour = await opened(E2EHomeserver(), theirs)
@@ -441,9 +438,8 @@ async def test_a_member_who_never_verifies_is_served_exactly_as_before(
 async def test_a_request_in_the_clear_opens_an_exchange_that_runs_over_olm(
     workspace: Workspace,
 ) -> None:
-    """Clients send the opening request with no Olm around it. It names no key and its one effect is
-    the `.ready` that comes back, so it is answered — and the exchange it opens finishes as any
-    other, every event of it Olm-encrypted."""
+    """The opening request names no key and its one effect is the `.ready`, so it is answered in the
+    clear — and every event of the exchange it opens is Olm-encrypted."""
     server = E2EHomeserver()
     server.encrypted[DIRECT] = ENCRYPTED
     installation = await primed(server, workspace)
@@ -462,9 +458,8 @@ async def test_a_request_in_the_clear_opens_an_exchange_that_runs_over_olm(
 async def test_a_start_in_the_clear_is_refused(
     workspace: Workspace, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """An unencrypted to-device event names a user and not a device, so it can never be the
-    evidence that one device is verified. A `.start` in the clear is ended where the member's client
-    can show why, rather than left to hang."""
+    """An unencrypted to-device event names a user and not a device, so it can never be evidence about
+    one: a `.start` in the clear is ended where the client can show why."""
     server = E2EHomeserver()
     server.encrypted[DIRECT] = ENCRYPTED
     installation = await primed(server, workspace)
@@ -549,9 +544,8 @@ async def stored_account(workspace: Workspace) -> str:
 async def test_two_processes_opening_one_device_agree_on_one_account(
     workspace: Workspace,
 ) -> None:
-    """`Installation.deliver` and the writeback path each open the device, so two of them meeting a
-    first encrypted event together is an ordinary interleaving, not a contrivance. Both leave with
-    one account, and the homeserver is offered one set of device keys."""
+    """Two callers opening the device on one first encrypted event is ordinary interleaving; both leave
+    with one account and the homeserver is offered one set of device keys."""
     server = E2EHomeserver()
     server.encrypted[DIRECT] = ENCRYPTED
     workspace.credentials[STORE_KEY_SLOT] = STORE_KEY
@@ -574,10 +568,8 @@ async def test_two_processes_opening_one_device_agree_on_one_account(
 
 @on_loop
 async def test_a_mint_that_loses_reads_the_winners_account(workspace: Workspace) -> None:
-    """The interleaving the primary key arbitrates, held still: a caller whose read saw no account
-    mints one, loses the insert, and leaves with the stored account rather than publishing its own
-    keys over the winner's. Two accounts for one device id is #16's named failure — the published
-    and the stored keys diverge and the bot silently stops decrypting, with no log to say why."""
+    """A caller that loses the insert leaves with the stored account rather than publishing its keys
+    over the winner's — two accounts for one device id is #16, silent and unlogged."""
     server = E2EHomeserver()
     server.encrypted[DIRECT] = ENCRYPTED
     await primed(server, workspace)
@@ -614,10 +606,8 @@ async def test_a_mint_that_loses_reads_the_winners_account(workspace: Workspace)
 async def test_a_parked_event_that_will_not_decrypt_is_dropped_rather_than_retried(
     workspace: Workspace,
 ) -> None:
-    """A parked event whose key arrives but whose plaintext is no Matrix event is dropped, named by
-    error class, and the stream carries on past it. Raising out of the retry loop would leave the
-    position where it was and the pending row unpruned, so one malformed payload would be retried on
-    every sync for good and silence that bot."""
+    """Raising out of the retry loop would leave the position unmoved and the row unpruned, so one
+    malformed payload would be retried every sync for good and silence that bot."""
     server = E2EHomeserver()
     server.encrypted[ROOM] = ENCRYPTED
     installation = await primed(server, workspace)
@@ -639,10 +629,8 @@ async def test_a_parked_event_that_will_not_decrypt_is_dropped_rather_than_retri
 
 @on_loop
 async def test_every_delivery_handler_encrypts_what_it_sends(workspace: Workspace) -> None:
-    """A room's words leave by three handlers — the terminal reply, a shared file, and a mid-turn
-    reply — and an encrypted room takes ciphertext from all three. A handler that sent its own
-    message rather than going through the surface's one seam would put a filename, a subject or a
-    mid-turn line on the server's timeline in the clear."""
+    """All three handlers go through the surface's one seam; one sending its own message would put a
+    filename, a subject or a mid-turn line on the timeline in the clear."""
     server = E2EHomeserver()
     server.encrypted[DIRECT] = ENCRYPTED
     await primed(server, workspace)
@@ -743,9 +731,8 @@ def test_device_keys_must_be_self_signed() -> None:
 
 
 def test_a_sealed_file_round_trips() -> None:
-    """The bytes a room gets back are the bytes that went in, and nothing about the plaintext is
-    left in the event: the `mxc://` names ciphertext, and the key that opens it travels inside the
-    Megolm payload rather than beside it."""
+    """The bytes come back unchanged and nothing about the plaintext is left in the event: the `mxc://`
+    names ciphertext and the key travels inside the Megolm payload."""
     data = b"the quarterly numbers, and a picture of a cat" * 40
     ciphertext, sealed = crypto.seal_file(data)
     assert ciphertext != data
@@ -757,9 +744,8 @@ def test_a_sealed_file_round_trips() -> None:
 
 
 def test_each_file_is_sealed_under_its_own_key_and_counter() -> None:
-    """AES-CTR reuses a keystream whenever the key and counter repeat, and two files sealed under
-    one pair are readable from their XOR without either key. So the pair is fresh per file, and the
-    same bytes sealed twice share no ciphertext."""
+    """AES-CTR reuses a keystream whenever key and counter repeat, and two files under one pair are
+    readable from their XOR — so the pair is fresh per file."""
     data = b"identical content"
     first, one = crypto.seal_file(data)
     second, two = crypto.seal_file(data)
@@ -769,11 +755,8 @@ def test_each_file_is_sealed_under_its_own_key_and_counter() -> None:
 
 
 def test_the_counter_half_of_the_iv_starts_at_zero() -> None:
-    """The low half of the IV is the block counter and the high half is the nonce.
-
-    The literals are written out rather than taken from the constants under test: sliced by its own
-    `FILE_COUNTER_BYTES`, this holds for any value of it, and a four-byte counter is both off-spec
-    and a 32 GiB ceiling before it carries into the nonce."""
+    """The literals are written out rather than read from the constants under test, so this holds for
+    any `FILE_COUNTER_BYTES` rather than restating it."""
     assert crypto.FILE_IV_BYTES == 16
     assert crypto.FILE_COUNTER_BYTES == 8
     _, sealed = crypto.seal_file(b"x")
@@ -784,11 +767,8 @@ def test_the_counter_half_of_the_iv_starts_at_zero() -> None:
 
 
 def test_a_hash_that_does_not_match_is_never_decrypted(monkeypatch: pytest.MonkeyPatch) -> None:
-    """What the media repository answers with is not yet what the sender sealed.
-
-    The cipher is replaced with a failure, so this asserts the ordering rather than the raise: a
-    test that only catches `FileHashMismatch` passes just as well when the decryption happens first
-    and the check happens after, which is the arrangement the bold claim rules out."""
+    """The cipher is replaced with a failure, so this asserts the *ordering*: catching
+    `FileHashMismatch` alone passes equally when decryption happens first."""
     ciphertext, sealed = crypto.seal_file(b"the original file")
     tampered = bytes([ciphertext[0] ^ 0xFF]) + ciphertext[1:]
     monkeypatch.setattr(
@@ -810,12 +790,8 @@ def test_a_hash_that_does_not_match_is_never_decrypted(monkeypatch: pytest.Monke
 
 
 def test_a_malformed_file_is_a_dropped_file_and_never_an_unhandled_error() -> None:
-    """Every field is a hostile sender's to choose, the whole object included.
-
-    It arrives as an event's `file`, so `{"msgtype": "m.image", "file": "gotcha"}` reaches this with
-    a string. A reader drops a file by catching `FileHashMismatch`, so a shape that escapes as
-    `AttributeError` or `KeyError` turns a dropped attachment into an unhandled exception in
-    whoever is reading the room."""
+    """Every field is a hostile sender's, the whole object included — a shape escaping as
+    `AttributeError` turns a dropped attachment into an unhandled error in whoever reads the room."""
     ciphertext, sealed = crypto.seal_file(b"a file")
     for broken in (
         "gotcha",
@@ -849,12 +825,8 @@ def test_a_file_naming_another_algorithm_is_refused() -> None:
 async def test_a_shared_file_costs_one_reading_of_the_rooms_encryption(
     workspace: Workspace,
 ) -> None:
-    """The bytes and the message naming them are decided by one observation, not two.
-
-    Reading a mutable remote value twice can disagree. A room that turned encryption on between the
-    upload and the send would seal the message over bytes already in the clear — a timeline that
-    looks encrypted above a media repository that is not, which is the failure sealing the bytes
-    exists to prevent."""
+    """One observation, not two: a room turning encryption on between upload and send would seal the
+    message over bytes already in the clear, which is the failure sealing exists to prevent."""
     server = E2EHomeserver()
     server.encrypted[DIRECT] = ENCRYPTED
     await primed(server, workspace)
@@ -913,9 +885,8 @@ async def test_a_sealed_member_file_is_opened_after_its_hash(workspace: Workspac
 
 @on_loop
 async def test_a_tampered_sealed_file_is_dropped_not_raised(workspace: Workspace) -> None:
-    """The media repository is the homeserver's, so what it answers with is a claim. A body that
-    does not match the file's own sha256 costs that file and never reaches the cipher — and never
-    stops the room being read."""
+    """The media repository is the homeserver's, so what it answers is a claim; a body that fails the
+    file's own sha256 costs that file and never reaches the cipher."""
     server = E2EHomeserver()
     installation = await primed(server, workspace)
     ciphertext, sealed = crypto.seal_file(b"the original")
