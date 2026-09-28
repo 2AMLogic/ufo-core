@@ -57,9 +57,7 @@ TARGET = vz.Account().max_number_of_one_time_keys // 2
 
 class Keys(Api):
     """The calls a device makes that the delivery suite's caller has no need of: who a token is and
-    which device it is bound to, the keys the device publishes, the claim that opens an Olm session
-    with another, a to-device send, the sync a device reads its own to-device queue from, and an
-    encrypted event into a room."""
+    which device it is bound to, the keys the device publishes, the claim that opens an Olm."""
 
     async def whoami(self) -> tuple[str, str]:
         answer = (await self._http.get(f"{CLIENT}/account/whoami")).json()
@@ -146,9 +144,7 @@ class Keys(Api):
 @dataclass
 class Peer:
     """One of the member's devices, over its own vodozemac account and its own access token.
-    `crypto_fakes.Peer` is this device against the fake transport; here every key it publishes and
-    claims, every to-device message it sends, and every event it puts in the room goes over the
-    client-server API, and `claimed` holds what the homeserver handed out for the bot's device."""
+    `crypto_fakes."""
 
     keys: Keys
     user: str
@@ -321,8 +317,7 @@ class Peer:
 @dataclass
 class Bot:
     """The bot's stream, held where `Installation.step` holds it: sync the homeserver, open the
-    device, hear the batch through `inbound`, keep the position. `batches` is what the homeserver
-    said, so a test reads its accounting out of the answers themselves."""
+    device, hear the batch through `inbound`, keep the position."""
 
     ctx: Workspace
     token: str
@@ -330,9 +325,7 @@ class Bot:
     batches: list[dict[str, Any]] = field(default_factory=list)
 
     async def hear(self) -> list[tuple[str, Any]]:
-        """One round: what the batch carried, as the surface hears it. The first round of a stream
-        admits nothing — it only fixes where the stream stands — and it is where a device with no
-        account yet mints one and publishes its keys."""
+        """One round: what the batch carried, as the surface hears it."""
         async with MatrixClient(HOMESERVER, self.token) as client:
             batch = await client.sync(self.since)
             device = await device_for(self.ctx, client)  # type: ignore[arg-type]
@@ -343,10 +336,7 @@ class Bot:
         return heard
 
     async def until(self, body: str, rounds: int = 4) -> list[tuple[str, Any]]:
-        """Everything heard up to and including the batch that carried this message. A room key and
-        the event it opens are the homeserver's to order, and either arrangement ends here: in one
-        batch the event is decrypted where it stands, and across two it is parked and heard once the
-        key lands."""
+        """Everything heard up to and including the batch that carried this message."""
         heard: list[tuple[str, Any]] = []
         for _ in range(rounds):
             heard += await self.hear()
@@ -380,8 +370,7 @@ def bodies(heard: list[tuple[str, Any]]) -> list[str]:
 
 async def drain(keys: Keys, user: str, device_id: str) -> list[dict[str, Any]]:
     """Claim keys for a device until the homeserver hands out its fallback key, which is what it
-    reaches for once the pool is empty. The claims are the one-time keys it had left and the
-    fallback key behind them, in the order they were handed out."""
+    reaches for once the pool is empty."""
     claimed = []
     for _ in range(2 * TARGET + 2):
         offered = await keys.claim(user, device_id)
@@ -483,9 +472,7 @@ async def test_an_encrypted_room_round_trips_through_a_real_homeserver(
 @on_loop
 async def test_the_homeserver_says_when_the_key_pool_has_run_out(engine: Any, pair: Pair) -> None:
     """The count is the homeserver's to keep: the bot is told what the pool holds in a batch it was
-    sent for another reason, and offers a fresh pool where what it is told is short of one. A
-    homeserver hands a device's one-time keys out on its own account, so nothing but its own count
-    says when they are gone."""
+    sent for another reason, and offers a fresh pool where what it is told is short of one."""
     ctx = bot_ctx(engine, pair.bot_token)
     bot = Bot(ctx, pair.bot_token)
     await bot.hear()
@@ -508,9 +495,7 @@ async def test_the_homeserver_says_when_the_key_pool_has_run_out(engine: Any, pa
 @on_loop
 async def test_a_drained_pool_is_served_by_the_fallback_key(engine: Any, pair: Pair) -> None:
     """A homeserver with no one-time key left to hand out reaches for the fallback key instead, and
-    hands out that same key as often as it is asked — which is what a device publishes one for. The
-    fake takes a fallback key and never reaches for it, so only a real homeserver's claim says the
-    bot's own is any use."""
+    hands out that same key as often as it is asked — which is what a device publishes one."""
     ctx = bot_ctx(engine, pair.bot_token)
     bot = Bot(ctx, pair.bot_token)
     await bot.hear()
@@ -534,8 +519,7 @@ async def test_a_drained_pool_is_served_by_the_fallback_key(engine: Any, pair: P
 @on_loop
 async def test_the_homeserver_announces_a_members_second_device(engine: Any, pair: Pair) -> None:
     """A member's new device is the homeserver's news to carry: it names the member in
-    `device_lists.changed` to every room that shares encryption with them, and the bot outdates what
-    it had pinned for that member and shares the room's session with the device it then finds."""
+    `device_lists."""
     ctx = bot_ctx(engine, pair.bot_token)
     bot = Bot(ctx, pair.bot_token)
     await bot.hear()
@@ -571,20 +555,8 @@ async def test_the_homeserver_announces_a_members_second_device(engine: Any, pai
 async def test_the_media_repository_holds_ciphertext_and_serves_it_where_we_ask(
     engine: Any, pair: Pair
 ) -> None:
-    """The two claims about sealed media that only a homeserver can answer.
-
-    **Where the bytes are served from.** `download` reads the authenticated client endpoint rather
-    than the media repository's own, because a homeserver holding `enable_authenticated_media` — the
-    Synapse default — does not serve authenticated media on the unauthenticated one.
-
-    The fake refuses the old endpoint too, so the fake suite catches a client that reverts to it.
-    What the fake cannot catch is the two of them being wrong together: its routing and the client's
-    path were written from one belief about which endpoint serves, so they agree by construction. A
-    fake cannot falsify the assumption it was built from. Only the homeserver can, and this asks it.
-
-    **What the repository holds.** An `EncryptedFile` is sealed before it is uploaded, so the object
-    behind the `mxc://` is ciphertext and not the file. A fake serves back whatever it stored, which
-    is true whether or not anything sealed it."""
+    """A fake cannot falsify the assumption it was built from: its routing and the client's path came
+    from one belief about which endpoint serves authenticated media. Only a homeserver can."""
     plaintext = b"the quarterly numbers, in confidence" * 8
     ciphertext, sealed = crypto.seal_file(plaintext)
 

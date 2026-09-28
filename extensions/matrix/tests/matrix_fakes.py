@@ -53,9 +53,7 @@ from ufo.sdk.surfaces import (
 BOT = "@ufo:example.org"
 HOMESERVER = "https://matrix.example.org"
 def media_id(filename: str) -> str:
-    """The id a media repository answers an upload with. A real one is opaque and carries none of
-    the filename's punctuation, so the fake mints one the media id grammar accepts rather than
-    handing back the filename and making every uri it produces unparseable."""
+    """The id a media repository answers an upload with."""
     return re.sub(r"[^A-Za-z0-9_-]", "", filename) or "media"
 
 
@@ -145,9 +143,8 @@ def batch(token: str, rooms: Mapping[str, list[dict[str, Any]]] | None = None) -
 
 @dataclass
 class Homeserver:
-    """Serves `/sync` from a script keyed by the `since` it is asked for, the room member lists,
-    and idempotent sends. Every request is recorded, headers included, so a test reads exactly what
-    went over the wire."""
+    """Serves `/sync` from a script keyed by the `since` it is asked for, the room member lists, and
+    idempotent sends."""
 
     syncs: dict[str | None, dict[str, Any]] = field(default_factory=dict)
     members: dict[str, list[str]] = field(default_factory=dict)
@@ -313,9 +310,7 @@ class Credentials:
 
 @dataclass
 class Workspace:
-    """A surface context's reach into core, recorded. `wanted` is the ambient decision's answer;
-    `broken` names the event ids whose admission raises, and `lost` maps an event id to the
-    database failure its admission raises. Alice and Bob are members."""
+    """A surface context's reach into core, recorded."""
 
     engine: AsyncEngine
     workspace_id: UUID = field(default_factory=uuid4)
@@ -360,9 +355,8 @@ class Workspace:
         return f"https://ufo.example.org/surface/web{fragment}"
 
     async def report_url(self, conversation_id: UUID, artifact: SharedArtifact) -> str | None:
-        """The portal link core's rule allows: a deploy without a portal offers none, and a room
-        the portal shows nobody — anything but the shared audience or a member's own — offers none
-        either, exactly the gate `SurfaceContext.report_url` applies."""
+        """The portal link core's rule allows: no portal offers none, and nor does a room the
+        portal shows nobody — the gate `SurfaceContext.report_url` applies."""
         if not self.portal:
             return None
         audience = next(
@@ -425,10 +419,7 @@ class Workspace:
 
     async def deliver_attachment(self, conversation_id: UUID, blob_key: str, rel: str) -> None:
         """A workspace path is a place, and core writes to it rather than beside it: the sandbox
-        write this resolves to takes the last caller of a path and keeps nothing of the one before.
-        The fake holds both readings — `delivered` is every call in order, and `workspace` is what
-        a member would find, so a second file landing on a name the first used is a file the fake
-        loses exactly as the deploy loses it."""
+        write this resolves to takes the last caller of a path and keeps nothing of the one."""
         self.delivered.append((conversation_id, blob_key, rel))
         self.workspace.setdefault(conversation_id, {})[rel] = blob_key
 
@@ -448,9 +439,7 @@ class Workspace:
         self, turn_id: UUID, blob_keys: tuple[str, ...], *, member_id: UUID | None
     ) -> None:
         """Core inserts one shared-artifact row per key and conflicts on `(turn_id, blob_key)`,
-        doing nothing on a repeat, so the same file attached twice to one turn is one row. The fake
-        holds both readings: `member_files` is every call in order, and `artifacts` is the set of
-        rows a repeat cannot grow."""
+        doing nothing on a repeat, so the same file attached twice to one turn is one row."""
         self.member_files.append((turn_id, tuple(blob_keys)))
         for blob_key in blob_keys:
             self.artifacts.add((turn_id, blob_key))
@@ -500,8 +489,8 @@ class Workspace:
     async def answerable_question(
         self, conversation_id: UUID, turn_id: UUID, question_index: int, member_id: UUID
     ) -> AskUserInput | None:
-        """The ask this workspace holds, where that turn asked it, the index is one it left open, and
-        the member is the one it was put to."""
+        """The ask this workspace holds, where that turn asked it, the index is one it left open,
+        and the member is the one it was put to."""
         if self.question is None or await self.latest_turn(conversation_id) != turn_id:
             return None
         open_indexes = self.open_questions
@@ -522,8 +511,7 @@ class Workspace:
     @asynccontextmanager
     async def tail(self, turn_id: UUID, since: str = "") -> AsyncIterator[Any]:
         """One turn's frames, each recorded as it is read, so a reader that stops at the terminal
-        frame is told apart from one the end of the script stopped. `endless` is a turn still
-        running: the stream holds after its script, the way a live tail does."""
+        frame is told apart from one the end of the script stopped."""
         self.tailed.append(turn_id)
 
         async def frames() -> AsyncIterator[tuple[str, LiveFrame]]:

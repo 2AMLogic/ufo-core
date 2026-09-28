@@ -72,8 +72,7 @@ def test_the_tools_validate_beside_the_builtins(manifest) -> None:
 
 def test_connect_is_an_instance_action_on_the_matrix_surface_row(manifest) -> None:
     """Setup belongs to the surface it sets up: core offers the action on the `matrix` row alone and
-    refuses any other target, so no turn holds it as a tool of its own. Linking is the other shape —
-    unbound, so a turn holds it wherever a member asks."""
+    refuses any other target, so no turn holds it as a tool of its own."""
     tools = {tool.name: tool for tool in manifest.tools}
     connect = tools[CONNECT_TOOL]
     assert connect.bound is not None

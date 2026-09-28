@@ -126,7 +126,8 @@ def encrypted_file_content(
 
     The `mxc://` moves inside `file`, beside the key that opens it, so the event names no url a
     client could fetch without the key. `info.mimetype` stays the file's own type rather than the
-    ciphertext's: it describes what the bytes become, and a room renders from it after decrypting."""
+    ciphertext's: it describes what the bytes become, and a room renders from it after
+    decrypting."""
     content: dict[str, Any] = {
         "msgtype": msgtype,
         "body": caption or filename,
@@ -290,8 +291,7 @@ def _blocks(markdown: str) -> list[str]:
 
 def _bounded(block: str, budget: int) -> list[str]:
     """One paragraph as the pieces it fits the budget in. A fenced block is reopened with the same
-    info string in each piece after the first, so each piece is a fence a client can close. The
-    line budget clamps at one byte, so an opener of its own length cannot wedge the cutting."""
+    info string in each piece after the first, so each piece is a fence a client can close."""
     if len(block.encode()) <= budget:
         return [block]
     lines = block.splitlines()
@@ -315,9 +315,8 @@ def _bounded(block: str, budget: int) -> list[str]:
 
 
 def _piece_bytes(held: Sequence[str], fence: str) -> int:
-    """The bytes one piece takes as it is sent: its opener, its lines, and the fence that closes
-    it again — the accounting `_bounded` flushes against, so a part never exceeds the budget by
-    an uncounted newline."""
+    """The bytes one piece takes — opener, lines, closing fence — the accounting `_bounded` flushes
+    against, so a part never exceeds the budget by an uncounted newline."""
     body = len("\n".join(held).encode())
     if fence:
         return len(fence.encode()) + body + len(FENCE) + 1
@@ -330,11 +329,7 @@ def _refenced(lines: Sequence[str], fence: str) -> str:
 
 
 def _cut(line: str, budget: int) -> list[str]:
-    """One line as the runs of it that fit, cut at a space where one does. The invariant: this
-    always returns, and every piece it yields but the last is non-empty — a character wider than
-    the budget moves to a piece of its own rather than wedging the loop, and a non-positive
-    budget takes one character a call. Indentation is kept: a continuation keeps the whitespace
-    it was written with."""
+    """One line as the runs of it that fit, cut at a space where one does."""
     pieces: list[str] = []
     rest = line
     while len(rest.encode()) > budget:

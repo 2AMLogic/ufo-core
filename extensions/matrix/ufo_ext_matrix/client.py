@@ -117,7 +117,8 @@ class MatrixClient:
 
     async def typing(self, room_id: str, user_id: str, active: bool, timeout_ms: int) -> None:
         """Say the bot is typing, or has stopped. The homeserver ends an indicator of its own accord
-        once `timeout_ms` passes, so a stream that drops stops the room typing without being told."""
+        once `timeout_ms` passes, so a stream that drops stops the room typing without being
+        told."""
         path = f"/rooms/{quote(room_id, safe='')}/typing/{quote(user_id, safe='')}"
         body: dict[str, Any] = {"typing": active}
         if active:

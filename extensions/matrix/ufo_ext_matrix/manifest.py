@@ -6,15 +6,18 @@ A Matrix room is a conversation and the people in it are members. The bot user's
 the surface's listener, and each terminal turn is one message back into its room — rich text under a
 relation to the message it answers — sent under a transaction id derived from the turn so a retried
 delivery lands once. The turn's shared files follow that reply as messages of their own, and words
-the turn marks for delivery before it ends reach the room as they are marked. The deploy names the bots
+the turn marks for delivery before it ends reach the room as they are marked. The deploy names the
+bots
 its listener runs in `UFO_MATRIX_BOTS`; each workspace holds its own bot's homeserver and token, and
 `matrix_connect` binds the bot the token belongs to. A member whose MXID the workspace's domain does
 not vouch for links it with `matrix_link_account` and a code sent from it; an admin undoes a link
 with `matrix_unlink_account`.
 
 Setup happens in chat and nowhere else. `matrix_connect` is an instance action bound to the `matrix`
-surface, so it is offered on that one surface row — `action:surface:matrix_connect` — rather than as a
-tool a turn holds everywhere, and `matrix-setup` is the skill that carries the order of the steps and
+surface, so it is offered on that one surface row — `action:surface:matrix_connect` — rather than as
+a
+tool a turn holds everywhere, and `matrix-setup` is the skill that carries the order of the steps
+and
 the four silences a misconfigured bot answers with.
 
 That is why `requires` is empty while a sibling extension names a seam it cannot run without.

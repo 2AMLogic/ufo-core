@@ -5,8 +5,10 @@ degradation path without needing the libraries gone from the environment — whi
 `test_matrix_crypto.py` cannot do, since it is the module that disappears exactly when the extra
 does. The lane installed without the extra runs this file too, where the flag is already off.
 
-The bot with the extra installed and the `matrix_store_key` slot empty has no device keys either, and
-reaches the same code by another road. It is here beside its neighbour because the two are told apart
+The bot with the extra installed and the `matrix_store_key` slot empty has no device keys either,
+and
+reaches the same code by another road. It is here beside its neighbour because the two are told
+apart
 by the line they log and by nothing else: `matrix.crypto_extra_missing` names a deploy to fix,
 `matrix.crypto_no_keys` names a slot to fill."""
 
@@ -126,8 +128,8 @@ async def test_a_batch_carrying_ciphertext_names_the_extra_once_and_is_heard_oth
 async def test_a_store_key_slot_left_empty_names_the_slot_rather_than_the_extra(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The neighbouring silence: the libraries are installed and the slot is empty, so `device_for`
-    returns no device without a word of its own, and the batch that met ciphertext is what says so."""
+    """The neighbouring silence: libraries installed, slot empty. `device_for` returns no device
+    without a word of its own, and the batch that met ciphertext is what says so."""
     monkeypatch.setattr(crypto, "INSTALLED", True)
     assert STORE_KEY_SLOT not in workspace.credentials
     server = Homeserver()

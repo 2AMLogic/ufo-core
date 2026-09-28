@@ -458,8 +458,8 @@ async def test_a_request_in_the_clear_opens_an_exchange_that_runs_over_olm(
 async def test_a_start_in_the_clear_is_refused(
     workspace: Workspace, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """An unencrypted to-device event names a user and not a device, so it can never be evidence about
-    one: a `.start` in the clear is ended where the client can show why."""
+    """An unencrypted to-device event names a user and not a device, so it can never be evidence
+    about one: a `.start` in the clear is ended where the client can show why."""
     server = E2EHomeserver()
     server.encrypted[DIRECT] = ENCRYPTED
     installation = await primed(server, workspace)
@@ -544,8 +544,8 @@ async def stored_account(workspace: Workspace) -> str:
 async def test_two_processes_opening_one_device_agree_on_one_account(
     workspace: Workspace,
 ) -> None:
-    """Two callers opening the device on one first encrypted event is ordinary interleaving; both leave
-    with one account and the homeserver is offered one set of device keys."""
+    """Two callers opening the device on one first encrypted event is ordinary interleaving; both
+    leave with one account and the homeserver is offered one set of device keys."""
     server = E2EHomeserver()
     server.encrypted[DIRECT] = ENCRYPTED
     workspace.credentials[STORE_KEY_SLOT] = STORE_KEY
@@ -755,8 +755,8 @@ def test_each_file_is_sealed_under_its_own_key_and_counter() -> None:
 
 
 def test_the_counter_half_of_the_iv_starts_at_zero() -> None:
-    """The literals are written out rather than read from the constants under test, so this holds for
-    any `FILE_COUNTER_BYTES` rather than restating it."""
+    """The literals are written out rather than read from the constants under test, so this holds
+    for any `FILE_COUNTER_BYTES` rather than restating it."""
     assert crypto.FILE_IV_BYTES == 16
     assert crypto.FILE_COUNTER_BYTES == 8
     _, sealed = crypto.seal_file(b"x")
@@ -791,7 +791,8 @@ def test_a_hash_that_does_not_match_is_never_decrypted(monkeypatch: pytest.Monke
 
 def test_a_malformed_file_is_a_dropped_file_and_never_an_unhandled_error() -> None:
     """Every field is a hostile sender's, the whole object included — a shape escaping as
-    `AttributeError` turns a dropped attachment into an unhandled error in whoever reads the room."""
+    `AttributeError` turns a dropped attachment into an unhandled error in whoever reads the
+    room."""
     ciphertext, sealed = crypto.seal_file(b"a file")
     for broken in (
         "gotcha",
@@ -885,8 +886,8 @@ async def test_a_sealed_member_file_is_opened_after_its_hash(workspace: Workspac
 
 @on_loop
 async def test_a_tampered_sealed_file_is_dropped_not_raised(workspace: Workspace) -> None:
-    """The media repository is the homeserver's, so what it answers is a claim; a body that fails the
-    file's own sha256 costs that file and never reaches the cipher."""
+    """The media repository is the homeserver's, so what it answers is a claim; a body that fails
+    the file's own sha256 costs that file and never reaches the cipher."""
     server = E2EHomeserver()
     installation = await primed(server, workspace)
     ciphertext, sealed = crypto.seal_file(b"the original")

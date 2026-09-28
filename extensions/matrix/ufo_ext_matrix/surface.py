@@ -211,7 +211,8 @@ def open_ask(writeback: Writeback) -> AskUserInput | None:
 
 def asked_questions(question: AskUserInput) -> tuple[Asked, ...]:
     """The ask as a room renders it: each question's words, the options it offers under the labels
-    the room answers by, and whether it takes more than one of them. A question core marked for words
+    the room answers by, and whether it takes more than one of them. A question core marked for
+    words
     offers none of its options, since the member answers it by writing."""
     return tuple(
         Asked(
@@ -279,7 +280,8 @@ def room_context(marker: str, heard: Sequence[Heard]) -> str:
 
 
 def audience_for(room_id: str, internal: bool) -> Audience:
-    """Who a room's conversation may disclose to: the room, and workspace-shared memory with it, when
+    """Who a room's conversation may disclose to: the room, and workspace-shared memory with it,
+    when
     everyone in it is a member; otherwise the room alone, sealed foreign. A direct room is a room
     like any other, so a room's audience only ever narrows — room to foreign when a non-member
     joins, and foreign for good after that."""
@@ -863,7 +865,8 @@ class Installation:
         The write bound is the store's and it refuses rather than truncating, so an oversized file
         is caught here rather than reaching the sync loop.
 
-        **A replayed event answers from its row.** The batch is replayed with the same event ids when
+        **A replayed event answers from its row.** The batch is replayed with the same event ids
+        when
         a crash falls between delivering it and writing the `/sync` position, so the file half needs
         the key `admit` already carries. Answering from the row rather than re-fetching keeps the
         member to one copy; answering with the *recorded* artifact key keeps the turn to one row,
@@ -924,7 +927,8 @@ class Installation:
         knowably intact whatever caused it: a failure that recurs parks the stream and names itself
         every cycle, rather than dropping a member's message and advancing the position past it.
 
-        A shared file is the message it came as: its caption or its name is what the member said, and
+        A shared file is the message it came as: its caption or its name is what the member said,
+        and
         everything downstream — ambient history, membership, the proof path — reads it as any other
         line rather than as a second kind of event."""
         admitting = since is not None
@@ -999,8 +1003,8 @@ class Installation:
     async def _guarded(
         self, admission: Awaitable[bool], event: str = "matrix.message_skipped"
     ) -> bool:
-        """One event's admission, where a failure costs that event alone: it is logged by error class
-        and the stream moves on. A database failure is not one — the batch is read again instead."""
+        """One event's admission, where a failure costs that event alone: it is logged by error
+        class and the stream moves on."""
         try:
             return await admission
         except sa.exc.SQLAlchemyError:
@@ -1036,8 +1040,7 @@ class Installation:
         self, client: MatrixClient, batch: Mapping[str, Any], since: str
     ) -> dict[str, list[Mapping[str, Any]]]:
         """The messages each cut-short room held between `since` and its timeline, oldest first,
-        walked back at most `BACKFILL_PAGES` pages. A room the bot can no longer read is left
-        with its timeline alone."""
+        walked back at most `BACKFILL_PAGES` pages."""
         earlier: dict[str, list[Mapping[str, Any]]] = {}
         for room_id, start in gaps(batch).items():
             found: list[Mapping[str, Any]] = []
@@ -1184,7 +1187,8 @@ class Installation:
         self, ctx: SurfaceContext, roster: Roster, client: MatrixClient, message: RoomMessage
     ) -> bool:
         """Admit one reply as the answer it names, returning whether it answered anything. A reply
-        naming no label of an open question answers nothing, and the message is admitted as the words
+        naming no label of an open question answers nothing, and the message is admitted as the
+        words
         it is."""
         opened = await self.open_question(ctx, roster, message.room_id, message.sender)
         if opened is None:
@@ -1267,7 +1271,8 @@ class Installation:
         sender: str,
         chosen: Sequence[Choice],
     ) -> str:
-        """Admit the options one member chose as the words they said, keyed by the event that carried
+        """Admit the options one member chose as the words they said, keyed by the event that
+        carried
         them, and return those words. The answer founds its own turn, whose reply belongs under the
         answer rather than under the question, so the message that turn answers is this event."""
         marker = mint_marker()

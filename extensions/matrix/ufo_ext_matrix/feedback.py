@@ -4,7 +4,8 @@ ends.
 None of this is delivery. The hub is lossy, so a frame that never arrives costs a typing indicator
 and never a turn's answer, and every call here is best effort: a homeserver that refuses one is
 logged by error class and the turn goes on. Typing carries the homeserver's own timeout and is
-refreshed under it, so a tail that drops ends the indicator on the server's clock rather than leaving
+refreshed under it, so a tail that drops ends the indicator on the server's clock rather than
+leaving
 a room typing forever; the terminal or parked frame ends it at once."""
 
 import asyncio

@@ -4,8 +4,10 @@ a question is answered by, and the frontmatter contract its skill is loaded unde
 modules import neither `ufo` nor an HTTP client, and a skill is data on disk, so these run on a
 checkout with only `pytest` and `pyyaml` installed.
 
-**The wire carve-outs.** `searchable` strikes the wire identifiers out of a text and leaves the prose
-the transition-language ban is about. Two carve-outs, each scoped to a version this repo does not get
+**The wire carve-outs.** `searchable` strikes the wire identifiers out of a text and leaves the
+prose
+the transition-language ban is about. Two carve-outs, each scoped to a version this repo does not
+get
 to rename: `PROTOCOL_NAMES` is a dotted Matrix event or algorithm name (`m.megolm.v1.aes-sha2`), and
 `WIRE_VERSIONS` is a version token a wire value carries — quoted alone, as an `EncryptedFile` names
 its format (`"v": "v2"`); a path segment, as a homeserver names its API (`/_matrix/client/v1/media`);
@@ -16,20 +18,25 @@ of it: `x"v1"legacy` would collapse to `xlegacy` and pass a ban that `x legacy` 
 
 The boundary is the quoting, and it is honest about the cost: a bare `v1` in a sentence fails, a
 backticked `v2` fails, and a version someone puts in double quotes mid-sentence passes. Reading a
-version out of a string literal is what writing the wire value looks like; the narrower rule — knowing
-every way a constant or a JSON field might be spelled — would fail on the next spelling rather than on
+version out of a string literal is what writing the wire value looks like; the narrower rule —
+knowing
+every way a constant or a JSON field might be spelled — would fail on the next spelling rather than
+on
 the next piece of transition language.
 
 **The seam guard's reach.** `guarded_paths` is the one walk both the guard and the test of its reach
 call. Written twice, the reach test asserted the reach of its own copy — which is how narrowing the
 guard to `PACKAGE.glob` left three seam tests green while `migrations/` stopped being read. The
-exclusion is one path and not one filename, so a `client.py` in any subdirectory the package grows is
+exclusion is one path and not one filename, so a `client.py` in any subdirectory the package grows
+is
 still read.
 
 `wire_callers` qualifies by class, because a bare function name is ambiguous across a package: a
-second class growing its own `send` would read as the seam itself. It matches an attribute call on the
+second class growing its own `send` would read as the seam itself. It matches an attribute call on
+the
 method name, which is the boundary of what it claims — a send reached through an alias, a `getattr`
-lookup or a lambda body is invisible to it. `dotted` names a module by the directories it sits in for
+lookup or a lambda body is invisible to it. `dotted` names a module by the directories it sits in
+for
 the same reason."""
 
 import ast
@@ -266,8 +273,7 @@ def guarded_paths() -> list[Path]:
 
 
 def test_only_one_seam_puts_a_message_on_the_wire() -> None:
-    """`MatrixSurface.send` is where an event meets `outbound`, so an encrypted room takes ciphertext
-    whichever handler speaks; a handler calling the client's own send would reach it in the clear."""
+    """`MatrixSurface."""
     callers = {
         caller
         for path in guarded_paths()
@@ -291,8 +297,8 @@ def test_the_seam_guard_catches_a_bypass_wherever_it_is_written() -> None:
 
 
 def test_the_seam_guard_reads_every_module_but_the_transport() -> None:
-    """A glob matching nothing satisfies an equality against one name as well as a clean package does,
-    so the reach itself is asserted rather than described."""
+    """A glob matching nothing satisfies an equality against one name as well as a clean package
+    does, so the reach itself is asserted rather than described."""
     assert sorted(PACKAGE.rglob(TRANSPORT)) == [PACKAGE / TRANSPORT]
     read = set(guarded_paths())
     assert {PACKAGE / "surface.py", PACKAGE / "feedback.py"} <= read
@@ -344,8 +350,8 @@ def test_no_transition_language(path: Path) -> None:
 
 
 def test_the_wire_carve_outs_do_not_launder_prose() -> None:
-    """A carve-out that grows quietly is a ban that stopped holding, so both its edges are asserted —
-    the right one especially, where dropping a lookahead turns `the /v1 rewrite` into prose."""
+    """A carve-out that grows quietly is a ban that stopped holding, so both its edges are asserted
+    — the right one especially, where dropping a lookahead turns `the /v1 rewrite` into prose."""
     passes = (
         'sealed = {"v": "v2"}',
         'ALGORITHM = "m.megolm.v1.aes-sha2"',
@@ -424,8 +430,8 @@ SILENCES = (
 
 
 def test_setup_names_every_silence_a_misconfigured_bot_answers_with() -> None:
-    """Each of these presents only as the agent not answering, so a reader without the list has nothing
-    to go on; three name the log line that tells them apart and the fourth has none to name."""
+    """Each presents only as the agent not answering, so a reader without the list has nothing to go
+    on; three name the log line that tells them apart and the fourth has no line to name."""
     traps = (SKILLS_ROOT / "matrix-setup" / "SKILL.md").read_text().split("## Traps", 1)[1]
     for tell in SILENCES:
         assert tell in traps, tell
@@ -909,8 +915,8 @@ def test_no_part_leaves_a_fence_open() -> None:
 
 
 def test_cut_guarantees_progress_on_any_budget() -> None:
-    """`_cut` always returns and every piece but the last is non-empty: a non-positive budget takes one
-    character a call rather than wedging the loop."""
+    """`_cut` always returns and every piece but the last is non-empty: a non-positive budget takes
+    one character a call rather than wedging the loop."""
     assert _cut("abc", 0) == ["a", "b", "c"]
     assert _cut("éé", 1) == ["é", "é"]
     assert all(piece for piece in _cut("x" * 10, 3)[:-1])
@@ -922,8 +928,8 @@ def test_cut_guarantees_progress_on_any_budget() -> None:
     ids=["opener-at-the-budget", "opener-past-the-budget"],
 )
 def test_a_fence_with_an_opener_at_or_past_the_budget_still_returns(opener_length: int) -> None:
-    """The case that wedged `parts`: a fence opener as long as the budget drives the per-line
-    budget to nothing. It returns, every part is a fence a client can close, and no part is empty."""
+    """The case that wedged `parts`: a fence opener as long as the budget drives the per-line budget
+    to nothing. It returns, every part is a fence a client can close, and no part is empty."""
     written = parts(f"{FENCE}{'x' * opener_length}\ncode\n{FENCE}")
     assert written
     assert all(part for part in written)
@@ -984,8 +990,8 @@ def test_an_mxc_uri_names_a_server_and_one_media_id() -> None:
     ),
 )
 def test_a_uri_carrying_a_path_of_its_own_is_not_a_media_id(uri: str) -> None:
-    """A single-segment `..` contains no character a ban would name, and httpx normalises dot segments
-    after the fact — so both parts are matched against what they may be."""
+    """A single-segment `..` contains no character a ban would name, and httpx normalises dot
+    segments after the fact — so both parts are matched against what they may be."""
     assert media_parts(uri) is None
 
 
@@ -1049,8 +1055,8 @@ def test_what_is_not_a_member_file(content: dict[str, object]) -> None:
 
 
 def test_a_caption_is_what_the_member_said_and_the_name_is_the_file() -> None:
-    """A file sent with words carries both and neither stands in for the other: one reading discards the
-    caption, the other writes the workspace file under a sentence."""
+    """A file sent with words carries both and neither stands in for the other: one reading discards
+    the caption, the other writes the workspace file under a sentence."""
     shared = room_file(ROOM, _file_event(body="here is the chart you asked for", filename="c.png"))
     assert shared is not None
     assert shared.caption == "here is the chart you asked for"

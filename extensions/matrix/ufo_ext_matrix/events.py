@@ -286,9 +286,8 @@ def poll_answer(room_id: str, event: Mapping[str, Any]) -> PollAnswer | None:
 
 
 def _thread_root(content: Mapping[str, Any]) -> str | None:
-    """The thread a message was sent in, read from its own relation: a room conversation is a
-    thread exactly where the message that founds a turn is in one, and the reply that answers it
-    belongs under the same root."""
+    """The thread a message was sent in, read from its own relation: a room conversation is a thread
+    exactly where the message that founds a turn is in one, and the reply that answers it."""
     relates = content.get("m.relates_to")
     if not isinstance(relates, Mapping) or relates.get("rel_type") != THREAD_RELATION:
         return None

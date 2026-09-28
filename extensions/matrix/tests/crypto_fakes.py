@@ -355,15 +355,7 @@ class Peer:
 @dataclass
 class Verifier:
     """A member's client verifying the bot's device over SAS, driving its own half of the exchange.
-
-    `answer` reads whatever the bot sent this device and replies as a client does: a `.ready` is
-    started from, an `.accept` is answered with this end's key, and a `.key` is checked against the
-    commitment before the MAC goes out. With `honest` false the MAC covers a key this device does
-    not hold — a relayed exchange, or a client naming a key that is not its own — and the bot must
-    end there rather than record anything verified.
-
-    `verified` is the verification the member asked for: the bot's own MAC, checked against the
-    device keys the homeserver published for the bot."""
+    `answer` reads whatever the bot sent this device and replies as a client does: a `."""
 
     peer: Peer
     transaction: str = "t-verify"

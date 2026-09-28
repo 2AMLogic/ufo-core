@@ -318,7 +318,8 @@ class Device:
     was chosen ahead of its own. The MAC the client sends covers the Ed25519 key it holds for its
     own device under the secret the exchange agreed, checked against the key pinned here: a MAC over
     any other key ends the exchange in `m.key_mismatch` and verifies nothing. A key id the MAC names
-    beyond that device's own — a cross-signing key, say — is covered by the key-id MAC and checked no
+    beyond that device's own — a cross-signing key, say — is covered by the key-id MAC and checked
+    no
     further, since nothing here signs or holds cross-signing keys.
 
     An exchange's age is read when it is looked up rather than only swept when the next one starts,
@@ -739,18 +740,7 @@ class Device:
         transaction: str,
         content: Mapping[str, Any],
     ) -> None:
-        """Take the other end's MAC, answer with this end's, and record the device verified.
-
-        The MAC the member's client sends covers the Ed25519 key it holds for its own device, under
-        the secret this exchange agreed. It is checked against the key pinned here, so a MAC over
-        any other key ends the exchange in `m.key_mismatch` and verifies nothing. A key id the MAC
-        names beyond that device's own — a cross-signing key, say — is covered by the key-id MAC and
-        checked no further, since nothing here signs or holds cross-signing keys.
-
-        The bot has no screen and compares no emoji: what it answers is the member's own
-        confirmation, arriving as a MAC their client sends only once they have confirmed. The
-        answer is what their client checks the bot's device key against, which is the verification
-        the member asked for."""
+        """Take the other end's MAC, answer with this end's, and record the device verified."""
         exchange = self._held(user, transaction)
         macs = content.get("mac")
         listed = content.get("keys")
@@ -836,8 +826,7 @@ class Device:
 
     def _hold(self, user: str, transaction: str, exchange: Verifying) -> None:
         """Hold one exchange, letting go of whatever timed out anywhere and of this workspace's
-        oldest past the limit. A member who opens exchange after exchange crowds out their own
-        workspace's and no other's."""
+        oldest past the limit."""
         now = now_ms()
         for slot in [held for held, kept in _EXCHANGES.items() if kept.aged(now)]:
             del _EXCHANGES[slot]
@@ -850,9 +839,8 @@ class Device:
         _EXCHANGES[slot] = exchange
 
     async def _olm_decrypt(self, rows: Rows, sender_key: str, message: vz.AnyOlmMessage) -> bytes:
-        """Decrypt with the sender's session that takes the message, or open an inbound session
-        from a pre-key message. The session's new state commits with whatever the plaintext
-        carried."""
+        """Decrypt with the sender's session that takes the message, or open an inbound session from
+        a pre-key message."""
         record = await rows.get(OLM_SESSIONS, sender_key, lock=True) or {"sessions": []}
         sessions = [vz.Session.from_pickle(p, self._pickle_key) for p in record["sessions"]]
         pre_key = message.to_pre_key()
@@ -1105,9 +1093,7 @@ class Device:
         content: Mapping[str, Any],
     ) -> set[tuple[str, str]]:
         """Send one payload to each device over Olm, opening a session with a claimed one-time key
-        where there is none, and return the devices it reached. A device that offers no signed key
-        is left out: a room key is offered again on the next message, and a verification event
-        ends that exchange in the member's client."""
+        where there is none, and return the devices it reached."""
         sessions: dict[tuple[str, str], list[vz.Session]] = {}
         unopened = []
         for device, keys in devices.items():

@@ -177,9 +177,7 @@ def _text(body: str) -> dict[str, Any]:
 
 
 def _named(number: str, letter: str, asked: Sequence[Asked]) -> Choice | None:
-    """The option one label names, or None where the ask offers no such option. A bare number names
-    an option of the only question there is; an ask of several is answered by label alone, since a
-    number on its own says nothing about which question it answers."""
+    """The option one label names, or None where the ask offers no such option."""
     if letter:
         question, option = int(number) - 1, option_of(letter)
     elif len(asked) == 1:

@@ -5,7 +5,8 @@ holds nothing else, and every message a turn sends — its reply, its files, and
 before it ends — lands once, as rich text, under the message it answers.
 
 A question the room answers is here too: a numbered reply and a tap on a poll arrive as the one
-choice, `answerable_question` is the only gate on who may answer what, the question is rewritten once
+choice, `answerable_question` is the only gate on who may answer what, the question is rewritten
+once
 however often its answer is delivered, and a turn that runs shows the room that it is running."""
 
 import asyncio
@@ -179,9 +180,7 @@ async def open_question(
     recorded: bool = True,
 ) -> Installation:
     """An installation whose room holds one turn that ended in a question: an older line of the
-    bot's, the member's message, the bot's reply, and the question as a message of its own, recorded
-    as the one that turn asked in. Every bot message is heard the way every message is, so a reply
-    to any of them is a reply to something the bot said."""
+    bot's, the member's message, the bot's reply, and the question as a message of its own."""
     workspace.question = ask.model_copy(update={"target_member_id": target})  # type: ignore[attr-defined]
     written = question_block(workspace.question.title, asked_questions(workspace.question))
     server.syncs["s1"] = batch(
@@ -846,8 +845,8 @@ def test_connect_again_in_the_same_workspace_replaces_the_binding() -> None:
 
 
 def test_no_connect_answer_carries_the_token(caplog: pytest.LogCaptureFixture) -> None:
-    """The admin fills the token through `request_credentials`, so no answer may put it back into the
-    transcript — not the one that binds, and none of the ones that refuse."""
+    """The admin fills the token through `request_credentials`, so no answer may put it back into
+    the transcript — not the one that binds, and none of the ones that refuse."""
     slots = {HOMESERVER_SLOT: "https://matrix.example.org", TOKEN_SLOT: TOKEN}
     server = Homeserver()
     refusing = Homeserver(failure=httpx.Response(500, json={"errcode": "M_UNKNOWN"}))
@@ -957,9 +956,8 @@ async def test_a_report_the_turn_named_nothing_reads_as_the_surfaces_own_words(
 async def test_a_details_report_the_portal_shows_nobody_points_at_the_workspace(
     workspace: Workspace,
 ) -> None:
-    """A room audience is neither the shared one nor a member's own, so core's gate offers no
-    link: the write-up then reads as the workspace pointer rather than vanishing — a turn whose
-    words were silence must never post an empty event."""
+    """A room audience is neither the shared one nor a member's own, so core's gate offers no link:
+    the write-up then reads as the workspace pointer rather than vanishing — a turn whose."""
     server = Homeserver()
     surface = MatrixSurface(transport=server.transport, bots="")
     wb = writeback(TerminalFrame(status="done", text=SILENCE_SENTINEL), artifacts=(report(),))
@@ -1624,8 +1622,7 @@ async def test_a_member_file_is_fetched(workspace: Workspace) -> None:
 @on_loop
 async def test_a_file_larger_than_it_declared_is_dropped(workspace: Workspace) -> None:
     """`info.size` is written by the sender, so the declared size saves a download and protects
-    nothing. A file arriving larger than it claimed is the case the cheap check misses, and the
-    fetched length is what decides."""
+    nothing."""
     server = Homeserver()
     installation = rig(server, workspace)
     async with MatrixClient(HOMESERVER, TOKEN, transport=server.transport) as client:
@@ -1661,10 +1658,8 @@ async def test_a_file_the_repository_does_not_hold_is_dropped_not_raised(workspa
 async def test_a_member_file_lands_in_the_workspace_and_is_named_to_the_turn(
     workspace: Workspace,
 ) -> None:
-    """The whole inbound path: a member shares a file, the bytes land under a workspace path, the
-    turn's own text names that path in its attachments element, and the artifact row points at what
-    landed. `member_message_attachments` is what a projection reads a member's files from, so a
-    path that never reaches the fence is a file the turn cannot see."""
+    """The whole inbound path. `member_message_attachments` is what a projection reads a member's
+    files from, so a path that never reaches the fence is a file the turn cannot see."""
     server = Homeserver()
     installation = await primed(server, workspace)
     async with MatrixClient(HOMESERVER, TOKEN, transport=server.transport) as client:
@@ -1686,9 +1681,7 @@ async def test_a_member_file_lands_in_the_workspace_and_is_named_to_the_turn(
 async def test_a_file_the_workspace_refuses_costs_the_file_and_not_the_turn(
     workspace: Workspace,
 ) -> None:
-    """The store's write bound refuses rather than truncating. A member whose attachment is too
-    large still gets a turn on their words — the failure this avoids is the one where a raise
-    reaches the sync loop and their room stops being read at all."""
+    """The store's write bound refuses rather than truncating."""
     workspace.write_limit_bytes = 2
     server = Homeserver()
     installation = await primed(server, workspace)
@@ -1709,8 +1702,7 @@ async def test_a_member_cannot_name_a_path_out_of_the_uploads_directory(
     workspace: Workspace,
 ) -> None:
     """The filename is the sender's to choose and it reaches a workspace path, so it is a name and
-    never a path. `../notes.md` landing as `uploads/../notes.md` resolves to the workspace root — in
-    bounds, and still an arbitrary write chosen by whoever is in the room."""
+    never a path. `../notes.md` landing as `uploads/../notes."""
     server = Homeserver()
     installation = await primed(server, workspace)
     async with MatrixClient(HOMESERVER, TOKEN, transport=server.transport) as client:
@@ -1730,9 +1722,7 @@ async def test_a_member_cannot_name_a_path_out_of_the_uploads_directory(
 @on_loop
 async def test_two_files_under_one_name_land_beside_each_other(workspace: Workspace) -> None:
     """A workspace path is a place, so a second `chart.png` delivered to the path the first holds
-    replaces it — and the turn reading `uploads/chart.png` reads the wrong member's bytes under a
-    fence naming the right member's file. The sanitiser numbers a name against the ones already
-    there, and what it is handed is the directory rather than an empty set."""
+    replaces it — and the turn reading `uploads/chart."""
     server = Homeserver()
     installation = await primed(server, workspace)
     async with MatrixClient(HOMESERVER, TOKEN, transport=server.transport) as client:
@@ -1785,8 +1775,7 @@ async def test_a_name_already_in_uploads_is_numbered_after_a_restart(
 @on_loop
 async def test_a_replayed_file_event_lands_once(workspace: Workspace) -> None:
     """`deliver` runs before the `/sync` position is written, so a crash between the two replays the
-    batch with the same event ids. Core admits the message once on that id; the file half answers
-    from the row it wrote rather than fetching, storing and delivering a second time."""
+    batch with the same event ids."""
     server = Homeserver()
     installation = await primed(server, workspace)
     async with MatrixClient(HOMESERVER, TOKEN, transport=server.transport) as client:

@@ -123,9 +123,8 @@ class Api:
         return [event for event in answer["chunk"] if isinstance(event, dict)]
 
     async def download(self, mxc: str) -> bytes:
-        """The bytes an `mxc://` names, through the authenticated media endpoint a modern
-        homeserver serves media on — the unauthenticated download endpoint refuses authenticated
-        media where `enable_authenticated_media` holds, which is the Synapse default."""
+        """The bytes an `mxc://` names, through the authenticated media endpoint a modern homeserver
+        serves media on — the unauthenticated download endpoint refuses authenticated media."""
         _, _, rest = mxc.partition("://")
         server, _, media_id = rest.partition("/")
         answer = await self._http.get(
