@@ -293,7 +293,37 @@ def _verified_key(user_id: str, device_id: str, ed25519: str, key: Any) -> str |
 
 @dataclass
 class Device:
-    """The bot's device over one store and one homeserver session."""
+    """The bot's device over one store and one homeserver session.
+
+    **The one-time key pool.** Keys the account already holds unpublished are offered again rather
+    than generated over. `_publish` stores the account before it uploads, so a refused upload is
+    retried with the same keys; generating on top of them would churn the pool past the maximum
+    every time a homeserver refuses.
+
+    **SAS device verification.** The bot is always the answering end: a member's client requests,
+    starts, sends its key and sends its MAC, and each of those is answered here. It offers no method
+    it cannot finish alone and it starts nothing — a `.ready` says which end is to start from.
+
+    The exchange is read only off Olm, where the sending device proves its identity key. The
+    homeserver stamps the sender of an *unencrypted* to-device event, so that names a user and never
+    a device, and can therefore never be the evidence that one device is verified. The opening
+    request names no key and its one effect is the `.ready` sent back, so a client that sends it in
+    the clear is answered; a `.start` in the clear is ended where the member's client can show why,
+    and every later event in the clear names no device to end it with. A device the store holds no
+    pinned keys for is written nothing at all: an exchange is with a device, and an unpinned one is
+    a device this bot can verify nothing about.
+
+    `.accept` commits to an ephemeral key before the other end's key is known — the commitment is
+    the hash of that key and of the `.start` as it arrived, so a member's client can tell the key
+    was chosen ahead of its own. The MAC the client sends covers the Ed25519 key it holds for its
+    own device under the secret the exchange agreed, checked against the key pinned here: a MAC over
+    any other key ends the exchange in `m.key_mismatch` and verifies nothing. A key id the MAC names
+    beyond that device's own — a cross-signing key, say — is covered by the key-id MAC and checked no
+    further, since nothing here signs or holds cross-signing keys.
+
+    An exchange's age is read when it is looked up rather than only swept when the next one starts,
+    so a `.key` arriving hours after its `.start` is let go on a bot nobody else is verifying too.
+    """
 
     store: CryptoStore
     client: MatrixClient
@@ -387,10 +417,8 @@ class Device:
         )
 
     def _one_time_keys(self, count: int) -> dict[str, Any]:
-        """`count` keys the homeserver has not been offered, signed. Keys the account already holds
-        unpublished are offered again rather than generated over: `_publish` stores the account
-        before it uploads so a refused upload is tried again with the same keys, and generating on
-        top of them would churn the pool past the maximum every time a homeserver refuses."""
+        """`count` keys the homeserver has not been offered, signed — unpublished keys the account
+        already holds are offered again rather than generated over."""
         self.account.generate_one_time_keys(max(count - len(self.account.one_time_keys), 0))
         return {
             f"{SIGNED_KEY}:{key_id}": self._signed({"key": key.to_base64()})
@@ -577,13 +605,8 @@ class Device:
                 await self._verification(rows, sender, device_id, device, kind, inner)
 
     async def _in_the_clear(self, sender: str, kind: str, content: Mapping[str, Any]) -> None:
-        """A verification event no Olm session carried. The homeserver stamps the sender of an
-        unencrypted to-device event, so it names a user and not a device: it can never be the
-        evidence that one device is verified, and the exchange itself is read only off Olm, where
-        the sending device proves its identity key. The opening request names no key and its one
-        effect is the `.ready` sent back, so the clients that send it in the clear are answered; a
-        `.start` in the clear is ended where the member's client can show why, and every later
-        event in the clear names no device to end it with."""
+        """A verification event no Olm session carried, so it names a user and not a device. Only
+        the opening request is answered; see the class docstring."""
         if kind != REQUEST:
             warn("matrix.verification_in_the_clear", kind=kind)
         if kind not in (REQUEST, START):
@@ -607,9 +630,8 @@ class Device:
         kind: str,
         content: Mapping[str, Any],
     ) -> None:
-        """One event of a SAS exchange, from the device Olm proved sent it. The bot is always the
-        answering end: a member's client requests, starts, sends its key and sends its MAC, and each
-        of those is answered here."""
+        """One event of a SAS exchange, from the device Olm proved sent it. The bot answers; it
+        never initiates."""
         transaction = content.get("transaction_id")
         if not isinstance(transaction, str):
             return
@@ -633,9 +655,8 @@ class Device:
     async def _ready(
         self, rows: Rows, user: str, device_id: str, transaction: str, content: Mapping[str, Any]
     ) -> None:
-        """Answer a request with `.ready`, naming SAS as the one method. The bot offers no method
-        it cannot finish alone, and it starts nothing: a `.ready` says which end the member's client
-        is to start from."""
+        """Answer a request with `.ready`, naming SAS as the one method and leaving the member's
+        client to start."""
         methods = content.get("methods")
         if content.get("from_device") != device_id or not isinstance(methods, list):
             return
@@ -654,8 +675,7 @@ class Device:
         self, rows: Rows, user: str, device_id: str, transaction: str, content: Mapping[str, Any]
     ) -> None:
         """Answer a `.start` with `.accept`, committing to an ephemeral key before the other end's
-        key is known. The commitment is the hash of that key and the `.start` as it arrived, so a
-        member's client can tell the key was chosen ahead of its own."""
+        is known."""
         if (
             content.get("method") != SAS
             or content.get("from_device") != device_id
@@ -788,9 +808,8 @@ class Device:
     async def _to_peer(
         self, rows: Rows, user: str, device_id: str, kind: str, content: Mapping[str, Any]
     ) -> None:
-        """One verification event, Olm-encrypted to the single device it answers. A device the
-        store holds no pinned keys for is written nothing: an exchange is with a device, and one
-        that is not pinned is one this bot cannot verify anything about."""
+        """One verification event, Olm-encrypted to the single device it answers. An unpinned
+        device is written nothing."""
         pinned = (await self.trusted(rows, [user])).get((user, device_id))
         if pinned is None:
             log("matrix.verification_unknown_device", device_id=device_id)
@@ -803,9 +822,8 @@ class Device:
         return (str(self.store.ctx.workspace_id), self.device_id, user, transaction)
 
     def _held(self, user: str, transaction: str) -> Verifying | None:
-        """The exchange that transaction id names, unless it has aged past `EXCHANGE_SECONDS`. The
-        age is read here rather than only swept when the next exchange starts, so a `.key` arriving
-        hours after its `.start` is let go on a bot nobody else is verifying too."""
+        """The exchange that transaction id names, unless it has aged past `EXCHANGE_SECONDS` —
+        read on lookup rather than swept."""
         slot = self._slot(user, transaction)
         exchange = _EXCHANGES.get(slot)
         if exchange is not None and exchange.aged(now_ms()):

@@ -288,9 +288,8 @@ def audience_for(room_id: str, internal: bool) -> Audience:
 
 
 def _refused(error: MatrixError) -> bool:
-    """A refusal no retry changes — the bot was removed from the room, the invite was withdrawn.
-    The batch goes on without that room rather than stalling the stream behind it; a rate limit or
-    a server error raises, and the batch is read again."""
+    """A refusal no retry changes, so the batch goes on without that room; a rate limit or a server
+    error raises instead and the batch is read again."""
     return 400 <= error.status < 500 and error.status != 429 and not error.unauthorized
 
 
@@ -752,9 +751,8 @@ class Installation:
         )
 
     async def _display_name(self, client: MatrixClient) -> str:
-        """The name the bot goes by, asked once a stream: a member who types it addresses the bot as
-        surely as one who mentions it. A profile the homeserver will not answer for names nothing,
-        and a mention, a pill, and the MXID still address the bot."""
+        """The name the bot goes by, asked once a stream; an unanswered profile names nothing and
+        leaves the other three ways of addressing it."""
         try:
             return await client.display_name(self.bot)
         except (MatrixError, httpx.HTTPError) as error:
@@ -775,9 +773,8 @@ class Installation:
 
     @asynccontextmanager
     async def _bound(self) -> AsyncIterator[SurfaceContext | None]:
-        """The listener gate for this bot. The gate reports lost ownership as a bare `RuntimeError`
-        on entry; only that entry is read as `FleetOwnershipLost`, so a `RuntimeError` from the body
-        backs this bot off like any other failure."""
+        """The listener gate for this bot. Only a `RuntimeError` from the gate's own entry reads as
+        `FleetOwnershipLost`; one from the body backs off like any failure."""
         async with AsyncExitStack() as stack:
             try:
                 ctx = await stack.enter_async_context(self.listener.workspace(self.bot))
@@ -864,15 +861,26 @@ class Installation:
         that stopped the turn would cost them the words too.
 
         The write bound is the store's and it refuses rather than truncating, so an oversized file
-        is caught here rather than reaching the sync loop."""
+        is caught here rather than reaching the sync loop.
+
+        **A replayed event answers from its row.** The batch is replayed with the same event ids when
+        a crash falls between delivering it and writing the `/sync` position, so the file half needs
+        the key `admit` already carries. Answering from the row rather than re-fetching keeps the
+        member to one copy; answering with the *recorded* artifact key keeps the turn to one row,
+        since core's attachment insert conflicts on `(turn_id, blob_key)` and a freshly minted key
+        would conflict with nothing. The row is written after core accepted the delivery, so it
+        stands for a file on disk rather than one that was about to be — a crash inside that gap
+        replays as it did before, and a crash anywhere else no longer costs a second copy.
+
+        **The sender's filename is a name, never a path.** Core's sanitiser drops path components,
+        collapses what is not a word character, and falls back for a name that is empty or nothing
+        but dots. What it numbers against is the set it is handed, so the set is the uploads
+        directory's own contents rather than an empty one: a second `chart.png` lands beside the
+        first as `chart-1.png`, whether it arrived in the same batch, an hour later, or from the
+        other member in the room. Reading the directory rather than remembering it is what makes
+        that hold across a restart."""
         landed = await read_delivered(ctx, shared.event_id)
         if landed is not None:
-            # The batch is replayed with the same event ids when a crash falls between delivering it
-            # and writing the `/sync` position, so the file half needs the key `admit` already
-            # carries. Answering from the row rather than re-fetching is what keeps the member to one
-            # copy; answering with the *recorded* artifact key is what keeps the turn to one row,
-            # since core's attachment insert conflicts on `(turn_id, blob_key)` and a freshly minted
-            # key would conflict with nothing.
             return (landed,)
 
         body = await self.fetched(client, shared)
@@ -887,13 +895,6 @@ class Installation:
         except ValueError as refused:
             log("matrix.file_unstored", installation=self.bot, reason=str(refused))
             return ()
-        # The name is the sender's to choose, so it is a name and not a path: core's own sanitiser
-        # drops path components, collapses what is not a word character, and falls back for a name
-        # that is empty or nothing but dots. What it numbers against is the set it is handed, so the
-        # set is the directory's own contents rather than an empty one — a second `chart.png` lands
-        # beside the first as `chart-1.png`, whether it arrived in the same batch, an hour later, or
-        # from the other member in the room. Reading the directory rather than remembering it is
-        # what makes that hold across a restart.
         listed = await ctx.list_workspace_files(conversation_id)
         used = {
             PurePosixPath(found.path).name
@@ -906,9 +907,6 @@ class Installation:
         except ValueError as refused:
             log("matrix.file_undelivered", installation=self.bot, reason=str(refused))
             return ()
-        # Written after the delivery core accepted, so a row stands for a file on disk rather than
-        # one that was about to be. A crash inside that gap replays as it did before; a crash
-        # anywhere else in the batch no longer costs the member a second copy.
         await write_delivered(ctx, shared.event_id, rel, key)
         return ((rel, key),)
 
@@ -924,7 +922,11 @@ class Installation:
         or any database failure raises, and the batch is read again. A database failure reaches
         here through the session `write_since` then writes through, so that session's state is not
         knowably intact whatever caused it: a failure that recurs parks the stream and names itself
-        every cycle, rather than dropping a member's message and advancing the position past it."""
+        every cycle, rather than dropping a member's message and advancing the position past it.
+
+        A shared file is the message it came as: its caption or its name is what the member said, and
+        everything downstream — ambient history, membership, the proof path — reads it as any other
+        line rather than as a second kind of event."""
         admitting = since is not None
         roster = Roster(ctx)
         self.names.update(room_names(batch))
@@ -939,9 +941,6 @@ class Installation:
             message = room_message(room_id, event)
             shared = None if message is not None else room_file(room_id, event)
             if shared is not None:
-                # A shared file is the message it came as: its caption or its name is what the
-                # member said, and everything downstream — ambient history, membership, the proof
-                # path — reads it as any other line rather than as a second kind of event.
                 message = RoomMessage(
                     room_id=shared.room_id,
                     event_id=shared.event_id,
