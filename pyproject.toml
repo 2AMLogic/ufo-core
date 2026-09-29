@@ -66,6 +66,7 @@ index_default = "ufo_ext_index_default:manifest"
 keyed_connectors = "ufo_ext_keyed_connectors:manifest"
 mcp = "ufo_ext_mcp:manifest"
 memory = "ufo_ext_memory.manifest:manifest"
+pulse = "ufo_ext_pulse.manifest:manifest"
 monitors = "ufo_ext_monitors.manifest:manifest"
 openrouter = "ufo_ext_openrouter:manifest"
 perplexity = "ufo_ext_perplexity:manifest"
@@ -133,11 +134,12 @@ packages = [
     "extensions/memory/ufo_ext_memory",
     "extensions/monitors/ufo_ext_monitors",
     "extensions/pipedream/ufo_ext_pipedream",
+    "extensions/pulse/ufo_ext_pulse",
     "extensions/rag/ufo_ext_rag",
     "extensions/redis_hub/ufo_ext_redis_hub",
-    "extensions/research/ufo_ext_research",
-    "extensions/report_digest/ufo_ext_report_digest",
     "extensions/repl/ufo_ext_repl",
+    "extensions/report_digest/ufo_ext_report_digest",
+    "extensions/research/ufo_ext_research",
     "extensions/sample/ufo_ext_sample",
     "extensions/scheduled_tasks/ufo_ext_scheduled_tasks",
     "extensions/sites/ufo_ext_sites",
