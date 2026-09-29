@@ -1540,7 +1540,7 @@ def _proxy_endpoint(
     clis = connector_clis(manifests)
     resolver = PerAgentRules(
         base=(
-            *model_rule_base(config),
+            *model_rule_base(config, manifests),
             *_one_shot(derive_artifact_store_rules(blob)),
             *derive_residential_rules(config.sandbox.residential_hosts),
         ),

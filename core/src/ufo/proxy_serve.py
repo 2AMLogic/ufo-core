@@ -9,17 +9,27 @@ import os
 from ufo.config import Config
 from ufo.runtime.access.credentials import deploy_env
 from ufo.runtime.access.egress_rules import Rule, ScopeRule, derive_model_rules
+from ufo.runtime.ext.manifest import Manifest
 
 MODEL_PROBES = ("claude-opus-4-8", "gpt-5")
 OWNER_DSN_ENV = "UFO_OWNER_DSN"
 OTLP_ENDPOINT_ENV = "UFO_OTLP_ENDPOINT"
 
 
-def model_rule_base(config: Config) -> tuple[Rule, ...]:
+def model_rule_base(config: Config, manifests: tuple[Manifest, ...] = ()) -> tuple[Rule, ...]:
     """The model-provider egress base of every sandbox's rule set: each configured provider whose
-    key is set in env is reachable and its sentinel swaps to the real key on the wire; no key set
-    anywhere means the sandbox would have no egress route, so it fails loud. The one place a
-    deploy's model hosts become egress rules."""
+    key is set in env is reachable and its sentinel swaps to the real key on the wire.
+
+    A deploy with neither key set has no *sandbox* model egress, which is fatal only if it has no
+    model provider at all. An extension may serve every model this deploy runs — core ships
+    `openrouter`, which is exactly that — and those calls are host-side, so they never touch these
+    rules. Failing boot on the two core key envs alone refuses to start a deploy that works, which
+    is why `manifests` is read here: a provider declared by an active extension, with its key set,
+    means the deploy has a brain and boot proceeds with no sandbox model route rather than none.
+    Only a keyed one counts — an extension is active because the pack bundles it, not because the
+    operator filled its key, so an unkeyed provider is no evidence the deploy can reach a model.
+
+    The one place a deploy's model hosts become egress rules."""
     key_envs = (config.models.anthropic_api_key_env, config.models.openai_api_key_env)
     hosts: set[str] = set()
     rules: list[Rule] = []
@@ -32,7 +42,12 @@ def model_rule_base(config: Config) -> tuple[Rule, ...]:
                 hosts |= rule.allowed_hosts
             else:
                 rules.append(rule)
-    if not hosts:
+    extension_keyed = any(
+        spec.key_env and deploy_env(spec.key_env)
+        for manifest in manifests
+        for spec in manifest.models
+    )
+    if not hosts and not extension_keyed:
         raise RuntimeError("no model provider key set; the sandbox would have no egress route")
     return (ScopeRule(allowed_hosts=frozenset(hosts)), *rules)
 
